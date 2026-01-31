@@ -410,7 +410,7 @@ fn select_update_encoding(
                             let field_count = component.fields.len();
                             // Compare per-component mask bytes vs sparse index list bytes.
                             // Values are sent in both encodings, so we only estimate index/mask overhead.
-                            mask_bytes += (field_count + 7) / 8;
+                            mask_bytes += field_count.div_ceil(8);
                             sparse_index_bytes += varu32_len(changed as u32)
                                 + changed * varu32_len((field_count - 1) as u32);
                         }
@@ -1056,11 +1056,10 @@ fn decode_update_section_sparse(
         reader.align_to_byte()?;
         let entity_id = reader.read_u32_aligned()?;
         let component_raw = reader.read_u16_aligned()?;
-        let component_id =
-            ComponentId::new(component_raw).ok_or_else(|| CodecError::InvalidMask {
-                kind: MaskKind::ComponentMask,
-                reason: MaskReason::InvalidComponentId { raw: component_raw },
-            })?;
+        let component_id = ComponentId::new(component_raw).ok_or(CodecError::InvalidMask {
+            kind: MaskKind::ComponentMask,
+            reason: MaskReason::InvalidComponentId { raw: component_raw },
+        })?;
         if let Some(prev) = prev_entity {
             if entity_id < prev {
                 return Err(CodecError::InvalidEntityOrder {
@@ -1086,7 +1085,7 @@ fn decode_update_section_sparse(
             .components
             .iter()
             .find(|component| component.id == component_id)
-            .ok_or_else(|| CodecError::InvalidMask {
+            .ok_or(CodecError::InvalidMask {
                 kind: MaskKind::ComponentMask,
                 reason: MaskReason::UnknownComponent {
                     component: component_id,
