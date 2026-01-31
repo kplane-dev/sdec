@@ -71,6 +71,7 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 **Responsibility:** represent replication schemas and field codecs.
 
 - Runtime schema model (initial release).
+- Optional `serde` support for JSON import/export (for tooling).
 - Deterministic `schema_hash`.
 - Field codec descriptors:
   - `Bool`, `UInt`, `SInt`, `VarUInt`, `VarSInt`
@@ -104,12 +105,14 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 ### `tools/`
 **Responsibility:** introspection / debugging tools.
 
-- Decode a packet and print structure.
+- `sdec-tools` CLI with `inspect` and `decode` commands.
+- Decode a packet and print structure or JSON.
 - Explain packet size by section/component/field (feature-gated tracing).
 - Diff baseline vs current (uses decoded representations).
 
 **Notes**
 - Tooling is a major adoption lever—treat it as a first-class product.
+- Tools reuse codec decode helpers (e.g., `decode_delta_packet`) rather than re-implementing parsing.
 
 ### `simbench/`
 **Responsibility:** reproducible scenarios for size/perf/robustness.

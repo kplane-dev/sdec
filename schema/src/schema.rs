@@ -5,7 +5,11 @@ use std::collections::HashSet;
 use crate::error::{SchemaError, SchemaResult};
 use crate::{ChangePolicy, ComponentId, FieldCodec, FieldDef, FixedPoint};
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// A component definition within a schema.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentDef {
     pub id: ComponentId,
@@ -37,6 +41,7 @@ impl ComponentDef {
 }
 
 /// A schema consisting of ordered components.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Schema {
     pub components: Vec<ComponentDef>,
