@@ -20,6 +20,12 @@
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](WIRE_FORMAT.md) for the binary protocol specification.
 
+## Docs
+
+- [Getting Started](docs/getting-started.md)
+- [Protocol: Sessions and Compact Frames](docs/protocol.md)
+- [Recovery and Failure Modes](docs/recovery.md)
+
 ## Workspace Structure
 
 | Crate | Description |
