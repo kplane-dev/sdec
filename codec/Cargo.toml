@@ -1,0 +1,23 @@
+[package]
+name = "sdec-codec"
+description = "Snapshot and delta encoding/decoding for the sdec codec"
+readme = "../README.md"
+keywords = ["netcode", "codec", "snapshot", "delta", "replication"]
+categories = ["network-programming", "game-development", "encoding"]
+documentation = "https://docs.rs/sdec-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "codec"
+
+[dependencies]
+bitstream.workspace = true
+wire.workspace = true
+schema.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

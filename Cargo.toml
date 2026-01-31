@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "bitstream",
+    "wire",
+    "schema",
+    "codec",
+    "tools",
+    "simbench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kplane-dev/sdec"
+rust-version = "1.75"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allow common patterns that clippy is overly strict about
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+# Internal crates
+bitstream = { path = "bitstream", version = "0.1.0", package = "sdec-bitstream" }
+wire = { path = "wire", version = "0.1.0", package = "sdec-wire" }
+schema = { path = "schema", version = "0.1.0", package = "sdec-schema" }
+codec = { path = "codec", version = "0.1.0", package = "sdec-codec" }
+
+# Testing
+proptest = "1.4"
+criterion = "0.5"
+
+# Serialization (for benchmarks/comparisons only)
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
