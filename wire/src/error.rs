@@ -3,90 +3,68 @@
 use std::fmt;
 
 /// Result type for wire format operations.
-pub type WireResult<T> = Result<T, WireError>;
+pub type WireResult<T> = Result<T, DecodeError>;
 
-/// Errors that can occur during wire format encoding/decoding.
+/// High-level decode errors for wire framing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WireError {
+#[non_exhaustive]
+pub enum DecodeError {
     /// Packet is too small to contain the required header.
-    PacketTooSmall {
-        /// Actual size in bytes.
-        actual: usize,
-        /// Minimum required size in bytes.
-        required: usize,
-    },
+    PacketTooSmall { actual: usize, required: usize },
 
     /// Invalid magic number in packet header.
-    InvalidMagic {
-        /// The invalid magic value found.
-        found: u32,
-    },
+    InvalidMagic { found: u32 },
 
     /// Unsupported wire version.
-    UnsupportedVersion {
-        /// The version found in the packet.
-        found: u16,
-    },
+    UnsupportedVersion { found: u16 },
 
     /// Invalid flags combination.
-    InvalidFlags {
-        /// The invalid flags value.
-        flags: u16,
-    },
+    InvalidFlags { flags: u16 },
 
-    /// Schema hash mismatch between packet and expected schema.
-    SchemaMismatch {
-        /// Schema hash in the packet.
-        packet_hash: u64,
-        /// Expected schema hash.
-        expected_hash: u64,
-    },
-
-    /// Packet exceeds configured size limit.
-    PacketTooLarge {
-        /// Actual size in bytes.
-        actual: usize,
-        /// Maximum allowed size in bytes.
-        limit: usize,
-    },
-
-    /// Section count exceeds limit.
-    TooManySections {
-        /// Number of sections found.
-        count: usize,
-        /// Maximum allowed sections.
-        limit: usize,
-    },
-
-    /// Entity count exceeds limit for the operation.
-    TooManyEntities {
-        /// Operation type (create, update, destroy).
-        operation: &'static str,
-        /// Number of entities.
-        count: usize,
-        /// Maximum allowed.
-        limit: usize,
-    },
-
-    /// Unknown section tag encountered.
-    UnknownSectionTag {
-        /// The unknown tag value.
-        tag: u8,
-    },
+    /// Invalid baseline tick for the packet kind.
+    InvalidBaselineTick { baseline_tick: u32, flags: u16 },
 
     /// Payload length mismatch.
-    PayloadLengthMismatch {
-        /// Declared length in header.
-        declared: usize,
-        /// Actual available bytes.
+    PayloadLengthMismatch { header_len: u32, actual_len: usize },
+
+    /// Unknown section tag encountered.
+    UnknownSectionTag { tag: u8 },
+
+    /// Limits exceeded.
+    LimitsExceeded {
+        kind: LimitKind,
+        limit: usize,
         actual: usize,
     },
 
-    /// Underlying bitstream error.
-    BitError(bitstream::BitError),
+    /// Section framing error.
+    SectionFraming(SectionFramingError),
 }
 
-impl fmt::Display for WireError {
+/// Specific wire limits that can be exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKind {
+    PacketBytes,
+    SectionCount,
+    SectionLength,
+}
+
+/// Errors that can occur while framing sections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionFramingError {
+    InvalidVarint,
+    LengthOverflow { value: u64 },
+    Truncated { needed: usize, available: usize },
+}
+
+/// Errors that can occur during encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    BufferTooSmall { needed: usize, available: usize },
+    LengthOverflow { length: usize },
+}
+
+impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PacketTooSmall { actual, required } => {
@@ -104,210 +82,123 @@ impl fmt::Display for WireError {
             Self::InvalidFlags { flags } => {
                 write!(f, "invalid flags: 0x{flags:04X}")
             }
-            Self::SchemaMismatch {
-                packet_hash,
-                expected_hash,
+            Self::InvalidBaselineTick {
+                baseline_tick,
+                flags,
             } => {
                 write!(
                     f,
-                    "schema mismatch: packet has 0x{packet_hash:016X}, expected 0x{expected_hash:016X}"
+                    "invalid baseline tick {baseline_tick} for flags 0x{flags:04X}"
                 )
             }
-            Self::PacketTooLarge { actual, limit } => {
-                write!(
-                    f,
-                    "packet too large: {actual} bytes exceeds limit of {limit}"
-                )
-            }
-            Self::TooManySections { count, limit } => {
-                write!(f, "too many sections: {count} exceeds limit of {limit}")
-            }
-            Self::TooManyEntities {
-                operation,
-                count,
-                limit,
+            Self::PayloadLengthMismatch {
+                header_len,
+                actual_len,
             } => {
                 write!(
                     f,
-                    "too many entities in {operation}: {count} exceeds limit of {limit}"
+                    "payload length mismatch: header {header_len} bytes but {actual_len} available"
                 )
             }
             Self::UnknownSectionTag { tag } => {
                 write!(f, "unknown section tag: {tag}")
             }
-            Self::PayloadLengthMismatch { declared, actual } => {
+            Self::LimitsExceeded {
+                kind,
+                limit,
+                actual,
+            } => {
+                write!(f, "{kind} limit exceeded: {actual} > {limit}")
+            }
+            Self::SectionFraming(err) => write!(f, "section framing error: {err}"),
+        }
+    }
+}
+
+impl fmt::Display for LimitKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::PacketBytes => "packet bytes",
+            Self::SectionCount => "section count",
+            Self::SectionLength => "section length",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl fmt::Display for SectionFramingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidVarint => write!(f, "invalid varint"),
+            Self::LengthOverflow { value } => write!(f, "length overflow: {value}"),
+            Self::Truncated { needed, available } => {
                 write!(
                     f,
-                    "payload length mismatch: declared {declared} bytes but {actual} available"
+                    "truncated section: need {needed} bytes, have {available}"
                 )
             }
-            Self::BitError(e) => {
-                write!(f, "bitstream error: {e}")
+        }
+    }
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BufferTooSmall { needed, available } => {
+                write!(f, "buffer too small: need {needed}, have {available}")
+            }
+            Self::LengthOverflow { length } => {
+                write!(f, "length overflow: {length}")
             }
         }
     }
 }
 
-impl std::error::Error for WireError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BitError(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for DecodeError {}
 
-impl From<bitstream::BitError> for WireError {
-    fn from(err: bitstream::BitError) -> Self {
-        Self::BitError(err)
-    }
-}
+impl std::error::Error for EncodeError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn error_display_packet_too_small() {
-        let err = WireError::PacketTooSmall {
+    fn decode_error_display_invalid_magic() {
+        let err = DecodeError::InvalidMagic { found: 0xDEAD_BEEF };
+        let msg = err.to_string();
+        assert!(msg.contains("DEADBEEF"));
+    }
+
+    #[test]
+    fn decode_error_display_limits_exceeded() {
+        let err = DecodeError::LimitsExceeded {
+            kind: LimitKind::SectionCount,
+            limit: 4,
             actual: 10,
-            required: 28,
         };
         let msg = err.to_string();
-        assert!(msg.contains("10"), "should mention actual size");
-        assert!(msg.contains("28"), "should mention required size");
+        assert!(msg.contains("section count"));
+        assert!(msg.contains("10"));
     }
 
     #[test]
-    fn error_display_invalid_magic() {
-        let err = WireError::InvalidMagic { found: 0xDEAD_BEEF };
-        let msg = err.to_string();
-        assert!(msg.contains("DEADBEEF"), "should show hex magic");
-    }
-
-    #[test]
-    fn error_display_unsupported_version() {
-        let err = WireError::UnsupportedVersion { found: 99 };
-        let msg = err.to_string();
-        assert!(msg.contains("99"), "should mention version");
-    }
-
-    #[test]
-    fn error_display_invalid_flags() {
-        let err = WireError::InvalidFlags { flags: 0xFF00 };
-        let msg = err.to_string();
-        assert!(msg.contains("FF00"), "should show hex flags");
-    }
-
-    #[test]
-    fn error_display_schema_mismatch() {
-        let err = WireError::SchemaMismatch {
-            packet_hash: 0x1234,
-            expected_hash: 0x5678,
+    fn section_framing_display() {
+        let err = SectionFramingError::Truncated {
+            needed: 10,
+            available: 4,
         };
         let msg = err.to_string();
-        assert!(msg.contains("1234"), "should show packet hash");
-        assert!(msg.contains("5678"), "should show expected hash");
+        assert!(msg.contains("truncated"));
+        assert!(msg.contains("10"));
     }
 
     #[test]
-    fn error_display_packet_too_large() {
-        let err = WireError::PacketTooLarge {
-            actual: 100_000,
-            limit: 65536,
+    fn encode_error_display() {
+        let err = EncodeError::BufferTooSmall {
+            needed: 10,
+            available: 4,
         };
         let msg = err.to_string();
-        assert!(msg.contains("100000"), "should mention actual size");
-        assert!(msg.contains("65536"), "should mention limit");
-    }
-
-    #[test]
-    fn error_display_too_many_sections() {
-        let err = WireError::TooManySections {
-            count: 100,
-            limit: 16,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("100"), "should mention count");
-        assert!(msg.contains("16"), "should mention limit");
-    }
-
-    #[test]
-    fn error_display_too_many_entities() {
-        let err = WireError::TooManyEntities {
-            operation: "create",
-            count: 500,
-            limit: 256,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("create"), "should mention operation");
-        assert!(msg.contains("500"), "should mention count");
-        assert!(msg.contains("256"), "should mention limit");
-    }
-
-    #[test]
-    fn error_display_unknown_section_tag() {
-        let err = WireError::UnknownSectionTag { tag: 42 };
-        let msg = err.to_string();
-        assert!(msg.contains("42"), "should mention tag");
-    }
-
-    #[test]
-    fn error_display_payload_length_mismatch() {
-        let err = WireError::PayloadLengthMismatch {
-            declared: 100,
-            actual: 50,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("100"), "should mention declared");
-        assert!(msg.contains("50"), "should mention actual");
-    }
-
-    #[test]
-    fn error_from_bit_error() {
-        let bit_err = bitstream::BitError::UnexpectedEof {
-            requested: 8,
-            available: 0,
-        };
-        let wire_err: WireError = bit_err.into();
-        assert!(matches!(wire_err, WireError::BitError(_)));
-
-        let msg = wire_err.to_string();
-        assert!(msg.contains("bitstream"), "should mention source");
-    }
-
-    #[test]
-    fn error_source_bit_error() {
-        let bit_err = bitstream::BitError::UnexpectedEof {
-            requested: 8,
-            available: 0,
-        };
-        let wire_err = WireError::BitError(bit_err);
-
-        // Test std::error::Error::source()
-        let source = std::error::Error::source(&wire_err);
-        assert!(source.is_some(), "should have a source");
-    }
-
-    #[test]
-    fn error_source_none_for_others() {
-        let err = WireError::InvalidMagic { found: 0 };
-        let source = std::error::Error::source(&err);
-        assert!(source.is_none(), "non-wrapped errors should have no source");
-    }
-
-    #[test]
-    fn error_equality() {
-        let err1 = WireError::InvalidMagic { found: 0x1234 };
-        let err2 = WireError::InvalidMagic { found: 0x1234 };
-        let err3 = WireError::InvalidMagic { found: 0x5678 };
-        assert_eq!(err1, err2);
-        assert_ne!(err1, err3);
-    }
-
-    #[test]
-    fn error_is_std_error() {
-        fn assert_error<E: std::error::Error>() {}
-        assert_error::<WireError>();
+        assert!(msg.contains("buffer too small"));
     }
 }

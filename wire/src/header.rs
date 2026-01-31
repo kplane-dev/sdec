@@ -22,7 +22,7 @@ impl PacketFlags {
     /// Flag indicating a delta snapshot packet.
     pub const DELTA_SNAPSHOT: u16 = 1 << 1;
 
-    /// Reserved bits mask (must be zero in v0).
+    /// Reserved bits mask (must be zero in version 0).
     const RESERVED_MASK: u16 = !0b11;
 
     /// Creates new flags from a raw value.
@@ -49,7 +49,7 @@ impl PacketFlags {
         self.0 & Self::DELTA_SNAPSHOT != 0
     }
 
-    /// Returns `true` if the flags are valid for v0.
+    /// Returns `true` if the flags are valid for version 0.
     ///
     /// Valid means exactly one of `FULL_SNAPSHOT` or `DELTA_SNAPSHOT` is set,
     /// and no reserved bits are set.
@@ -75,7 +75,7 @@ impl PacketFlags {
     }
 }
 
-/// Packet header (v0).
+/// Packet header (version 0).
 ///
 /// This struct represents the header fields *after* the magic number.
 /// The magic number is validated separately during decoding and is not

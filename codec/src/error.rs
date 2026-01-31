@@ -9,7 +9,7 @@ pub type CodecResult<T> = Result<T, CodecError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodecError {
     /// Wire format error.
-    Wire(wire::WireError),
+    Wire(wire::DecodeError),
 
     /// Baseline tick not found in history.
     BaselineNotFound {
@@ -82,8 +82,8 @@ impl std::error::Error for CodecError {
     }
 }
 
-impl From<wire::WireError> for CodecError {
-    fn from(err: wire::WireError) -> Self {
+impl From<wire::DecodeError> for CodecError {
+    fn from(err: wire::DecodeError) -> Self {
         Self::Wire(err)
     }
 }
@@ -136,14 +136,14 @@ mod tests {
 
     #[test]
     fn error_from_wire_error() {
-        let wire_err = wire::WireError::InvalidMagic { found: 0x1234 };
+        let wire_err = wire::DecodeError::InvalidMagic { found: 0x1234 };
         let codec_err: CodecError = wire_err.into();
         assert!(matches!(codec_err, CodecError::Wire(_)));
     }
 
     #[test]
     fn error_source_wire() {
-        let wire_err = wire::WireError::InvalidMagic { found: 0x1234 };
+        let wire_err = wire::DecodeError::InvalidMagic { found: 0x1234 };
         let codec_err = CodecError::Wire(wire_err);
         let source = std::error::Error::source(&codec_err);
         assert!(source.is_some(), "should have a source");
