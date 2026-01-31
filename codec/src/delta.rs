@@ -183,6 +183,12 @@ pub fn apply_delta_snapshot_from_packet(
             flags: header.flags.raw(),
         }));
     }
+    if header.baseline_tick == 0 {
+        return Err(CodecError::Wire(wire::DecodeError::InvalidBaselineTick {
+            baseline_tick: header.baseline_tick,
+            flags: header.flags.raw(),
+        }));
+    }
     if header.baseline_tick != baseline.tick.raw() {
         return Err(CodecError::BaselineTickMismatch {
             expected: baseline.tick.raw(),
@@ -190,6 +196,12 @@ pub fn apply_delta_snapshot_from_packet(
         });
     }
 
+    if header.baseline_tick == 0 {
+        return Err(CodecError::Wire(wire::DecodeError::InvalidBaselineTick {
+            baseline_tick: header.baseline_tick,
+            flags: header.flags.raw(),
+        }));
+    }
     let expected_hash = schema_hash(schema);
     if header.schema_hash != expected_hash {
         return Err(CodecError::SchemaMismatch {
@@ -241,20 +253,6 @@ pub fn decode_delta_packet(
     }
 
     let (destroys, creates, updates) = decode_delta_sections(schema, packet, limits)?;
-    let updates = updates
-        .into_iter()
-        .map(|update| DeltaUpdateEntity {
-            id: update.id,
-            components: update
-                .components
-                .into_iter()
-                .map(|component| DeltaUpdateComponent {
-                    id: component.id,
-                    fields: component.fields,
-                })
-                .collect(),
-        })
-        .collect();
 
     Ok(DeltaDecoded {
         tick: SnapshotTick::new(header.tick),
@@ -611,7 +609,7 @@ fn decode_update_section(
     schema: &schema::Schema,
     body: &[u8],
     limits: &CodecLimits,
-) -> CodecResult<Vec<UpdateEntity>> {
+) -> CodecResult<Vec<DeltaUpdateEntity>> {
     if body.len() > limits.max_section_bytes {
         return Err(CodecError::LimitsExceeded {
             kind: LimitKind::SectionBytes,
@@ -655,14 +653,14 @@ fn decode_update_section(
         for (idx, component) in schema.components.iter().enumerate() {
             if component_mask[idx] {
                 let fields = decode_update_component(component, &mut reader, limits)?;
-                components.push(UpdateComponent {
+                components.push(DeltaUpdateComponent {
                     id: component.id,
                     fields,
                 });
             }
         }
 
-        updates.push(UpdateEntity {
+        updates.push(DeltaUpdateEntity {
             id: EntityId::new(id),
             components,
         });
@@ -678,26 +676,14 @@ fn decode_update_section(
     Ok(updates)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UpdateEntity {
-    id: EntityId,
-    components: Vec<UpdateComponent>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UpdateComponent {
-    id: ComponentId,
-    fields: Vec<(usize, FieldValue)>,
-}
-
 fn decode_delta_sections(
     schema: &schema::Schema,
     packet: &WirePacket<'_>,
     limits: &CodecLimits,
-) -> CodecResult<(Vec<EntityId>, Vec<EntitySnapshot>, Vec<UpdateEntity>)> {
+) -> CodecResult<(Vec<EntityId>, Vec<EntitySnapshot>, Vec<DeltaUpdateEntity>)> {
     let mut destroys: Option<Vec<EntityId>> = None;
     let mut creates: Option<Vec<EntitySnapshot>> = None;
-    let mut updates: Option<Vec<UpdateEntity>> = None;
+    let mut updates: Option<Vec<DeltaUpdateEntity>> = None;
 
     for section in &packet.sections {
         match section.tag {
@@ -834,7 +820,10 @@ fn apply_creates(
     Ok(result)
 }
 
-fn apply_updates(entities: &mut [EntitySnapshot], updates: &[UpdateEntity]) -> CodecResult<()> {
+fn apply_updates(
+    entities: &mut [EntitySnapshot],
+    updates: &[DeltaUpdateEntity],
+) -> CodecResult<()> {
     for update in updates {
         let idx = entities
             .binary_search_by_key(&update.id.raw(), |e| e.id.raw())
