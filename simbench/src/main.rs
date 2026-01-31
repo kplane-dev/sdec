@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bitstream::BitVecWriter;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use codec::{encode_delta_snapshot_with_scratch, encode_full_snapshot, CodecLimits, CodecScratch};
 use serde::Serialize;
 use wire::Limits as WireLimits;
@@ -16,6 +16,9 @@ use wire::Limits as WireLimits;
     about = "sdec simulation benchmark harness"
 )]
 struct Cli {
+    /// Scenario to run (dense, idle, burst, visibility).
+    #[arg(long, value_enum, default_value_t = Scenario::Dense)]
+    scenario: Scenario,
     /// Number of simulated players/entities.
     #[arg(long, default_value_t = 16)]
     players: u32,
@@ -25,9 +28,33 @@ struct Cli {
     /// RNG seed for deterministic results.
     #[arg(long, default_value_t = 1)]
     seed: u64,
-    /// Optional burst event cadence.
+    /// Probability an entity is idle this tick (idle scenario).
+    #[arg(long, default_value_t = 0.8)]
+    idle_ratio: f32,
+    /// Max jitter amplitude in quantized units (idle scenario).
+    #[arg(long, default_value_t = 2)]
+    jitter_amplitude_q: i64,
+    /// Change threshold in quantized units.
+    #[arg(long, default_value_t = 0)]
+    threshold_q: u32,
+    /// Optional burst event cadence (burst scenario).
     #[arg(long)]
     burst_every: Option<u32>,
+    /// Fraction of entities affected by burst.
+    #[arg(long, default_value_t = 0.25)]
+    burst_fraction: f32,
+    /// Burst amplitude in quantized units.
+    #[arg(long, default_value_t = 200)]
+    burst_amplitude_q: i64,
+    /// Number of clients to evaluate (visibility scenario).
+    #[arg(long, default_value_t = 4)]
+    clients: u32,
+    /// Visibility radius in quantized units (visibility scenario).
+    #[arg(long, default_value_t = 200)]
+    visibility_radius_q: i64,
+    /// World size in quantized units (visibility scenario).
+    #[arg(long, default_value_t = 2000)]
+    world_size_q: i64,
     /// Output directory for summary.json.
     #[arg(long, default_value = "target/simbench")]
     out_dir: PathBuf,
@@ -39,9 +66,17 @@ struct Cli {
     max_avg_delta_bytes: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, PartialEq, Eq)]
+enum Scenario {
+    Dense,
+    Idle,
+    Burst,
+    Visibility,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let schema = demo_schema();
+    let schema = demo_schema(cli.threshold_q);
     let limits = CodecLimits::default();
     let wire_limits = WireLimits::default();
 
@@ -49,25 +84,37 @@ fn main() -> Result<()> {
         .with_context(|| format!("create output dir {}", cli.out_dir.display()))?;
 
     let mut rng = Rng::new(cli.seed);
-    let mut states = init_states(cli.players, &mut rng);
+    let mut states = init_states(cli.players, &mut rng, cli.world_size_q);
 
-    let mut summary = Summary::new(cli.players, cli.ticks, cli.seed, cli.burst_every);
     let mut baseline_snapshot = codec::Snapshot {
         tick: codec::SnapshotTick::new(0),
         entities: Vec::new(),
     };
     let mut scratch = CodecScratch::default();
 
+    let mut sdec = EncoderStats::default();
+    let mut naive = EncoderStats::default();
+    let mut full_bincode_bytes_total = 0u64;
+    let mut full_bytes_total = 0u64;
+    let mut full_count = 0u32;
+
+    let mut per_client_stats = if cli.scenario == Scenario::Visibility {
+        Some(PerClientStats::new(cli.clients))
+    } else {
+        None
+    };
+    let mut client_baselines: Vec<codec::Snapshot> = Vec::new();
+
     for tick in 1..=cli.ticks {
-        step_states(&mut states, &mut rng, tick, cli.burst_every);
+        step_states(&mut states, &mut rng, tick, &cli);
         let snapshot = build_snapshot(codec::SnapshotTick::new(tick), &states);
 
-        summary.full_bincode_bytes_total += encode_bincode_snapshot(&states)? as u64;
+        full_bincode_bytes_total += encode_bincode_snapshot(&states)? as u64;
 
         if tick == 1 {
             let full_bytes = encode_full(&schema, &snapshot, &limits)?;
-            summary.full_bytes_total += full_bytes.len() as u64;
-            summary.full_count += 1;
+            full_bytes_total += full_bytes.len() as u64;
+            full_count += 1;
         } else {
             let start = Instant::now();
             let delta_bytes = encode_delta_with_scratch(
@@ -78,27 +125,51 @@ fn main() -> Result<()> {
                 &mut scratch,
             )?;
             let elapsed = start.elapsed();
-            summary.delta_bytes_total += delta_bytes.len() as u64;
-            summary.delta_count += 1;
-            summary.delta_sizes.push(delta_bytes.len() as u64);
-            summary.encode_us.push(elapsed.as_micros() as u64);
+            sdec.add(delta_bytes.len() as u64, elapsed.as_micros() as u64);
+            let naive_bytes = encode_naive_delta(&schema, &baseline_snapshot, &snapshot)?;
+            naive.add(naive_bytes as u64, 0);
+        }
 
-            summary.delta_naive_bytes_total +=
-                encode_naive_delta(&baseline_snapshot, &snapshot)? as u64;
+        if cli.scenario == Scenario::Visibility {
+            if client_baselines.is_empty() {
+                client_baselines = (0..cli.clients)
+                    .map(|_| codec::Snapshot {
+                        tick: codec::SnapshotTick::new(0),
+                        entities: Vec::new(),
+                    })
+                    .collect();
+            }
+            run_visibility(
+                &schema,
+                &states,
+                tick,
+                &mut client_baselines,
+                &mut scratch,
+                cli.visibility_radius_q,
+                per_client_stats.as_mut().expect("per-client stats"),
+            )?;
         }
 
         baseline_snapshot = snapshot;
     }
 
-    summary.finalize();
+    let summary = Summary::new(
+        &cli,
+        full_count,
+        full_bytes_total,
+        full_bincode_bytes_total,
+        sdec,
+        naive,
+        per_client_stats,
+    );
+
     summary.assert_budgets(cli.max_p95_delta_bytes, cli.max_avg_delta_bytes)?;
     write_summary_json(&cli.out_dir, &summary)?;
 
-    // Validate that encoded payloads would be accepted by the wire limits.
-    if summary.p95_delta_bytes > wire_limits.max_packet_bytes as u64 {
+    if summary.sdec.delta_p95 > wire_limits.max_packet_bytes as u64 {
         anyhow::bail!(
             "p95 delta bytes {} exceeds wire packet limit {}",
-            summary.p95_delta_bytes,
+            summary.sdec.delta_p95,
             wire_limits.max_packet_bytes
         );
     }
@@ -165,7 +236,11 @@ fn encode_bincode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
     Ok(bytes.len())
 }
 
-fn encode_naive_delta(baseline: &codec::Snapshot, current: &codec::Snapshot) -> Result<usize> {
+fn encode_naive_delta(
+    schema: &schema::Schema,
+    baseline: &codec::Snapshot,
+    current: &codec::Snapshot,
+) -> Result<usize> {
     let mut writer = BitVecWriter::new();
     writer.align_to_byte();
     let mut changed_entities = 0u32;
@@ -174,7 +249,7 @@ fn encode_naive_delta(baseline: &codec::Snapshot, current: &codec::Snapshot) -> 
     for entity in &current.entities {
         let base = baseline.entities.iter().find(|e| e.id == entity.id);
         if let Some(base) = base {
-            let changed_fields = diff_entity_fields(base, entity);
+            let changed_fields = diff_entity_fields(schema, base, entity)?;
             if !changed_fields.is_empty() {
                 changed_entities += 1;
                 entity_offsets.push((entity.id.raw(), changed_fields));
@@ -196,26 +271,106 @@ fn encode_naive_delta(baseline: &codec::Snapshot, current: &codec::Snapshot) -> 
 }
 
 fn diff_entity_fields(
+    schema: &schema::Schema,
     baseline: &codec::EntitySnapshot,
     current: &codec::EntitySnapshot,
-) -> Vec<(usize, codec::FieldValue)> {
+) -> Result<Vec<(usize, codec::FieldValue)>> {
     let mut result = Vec::new();
     if baseline.components.is_empty() || current.components.is_empty() {
-        return result;
+        return Ok(result);
     }
     let base_component = &baseline.components[0];
     let curr_component = &current.components[0];
-    for (idx, (base, curr)) in base_component
+    let component = schema
+        .components
+        .first()
+        .context("missing component definition")?;
+
+    for (idx, (field, (base, curr))) in component
         .fields
         .iter()
-        .zip(curr_component.fields.iter())
+        .zip(
+            base_component
+                .fields
+                .iter()
+                .zip(curr_component.fields.iter()),
+        )
         .enumerate()
     {
-        if base != curr {
+        if field_changed(field, *base, *curr)? {
             result.push((idx, *curr));
         }
     }
-    result
+    Ok(result)
+}
+
+fn field_changed(
+    field: &schema::FieldDef,
+    baseline: codec::FieldValue,
+    current: codec::FieldValue,
+) -> Result<bool> {
+    match field.change {
+        schema::ChangePolicy::Always => field_differs(field, baseline, current),
+        schema::ChangePolicy::Threshold { threshold_q } => {
+            field_exceeds_threshold(field, baseline, current, threshold_q)
+        }
+    }
+}
+
+fn field_differs(
+    field: &schema::FieldDef,
+    baseline: codec::FieldValue,
+    current: codec::FieldValue,
+) -> Result<bool> {
+    Ok(match (baseline, current) {
+        (codec::FieldValue::Bool(a), codec::FieldValue::Bool(b)) => a != b,
+        (codec::FieldValue::UInt(a), codec::FieldValue::UInt(b)) => a != b,
+        (codec::FieldValue::SInt(a), codec::FieldValue::SInt(b)) => a != b,
+        (codec::FieldValue::VarUInt(a), codec::FieldValue::VarUInt(b)) => a != b,
+        (codec::FieldValue::VarSInt(a), codec::FieldValue::VarSInt(b)) => a != b,
+        (codec::FieldValue::FixedPoint(a), codec::FieldValue::FixedPoint(b)) => a != b,
+        _ => {
+            anyhow::bail!(
+                "field type mismatch for {:?} ({:?} vs {:?})",
+                field.id,
+                baseline,
+                current
+            )
+        }
+    })
+}
+
+fn field_exceeds_threshold(
+    field: &schema::FieldDef,
+    baseline: codec::FieldValue,
+    current: codec::FieldValue,
+    threshold_q: u32,
+) -> Result<bool> {
+    let threshold_q = threshold_q as u64;
+    Ok(match (baseline, current) {
+        (codec::FieldValue::FixedPoint(a), codec::FieldValue::FixedPoint(b)) => {
+            (a - b).unsigned_abs() > threshold_q
+        }
+        (codec::FieldValue::UInt(a), codec::FieldValue::UInt(b)) => a.abs_diff(b) > threshold_q,
+        (codec::FieldValue::SInt(a), codec::FieldValue::SInt(b)) => {
+            (a - b).unsigned_abs() > threshold_q
+        }
+        (codec::FieldValue::VarUInt(a), codec::FieldValue::VarUInt(b)) => {
+            a.abs_diff(b) > threshold_q
+        }
+        (codec::FieldValue::VarSInt(a), codec::FieldValue::VarSInt(b)) => {
+            (a - b).unsigned_abs() > threshold_q
+        }
+        (codec::FieldValue::Bool(a), codec::FieldValue::Bool(b)) => a != b,
+        _ => {
+            anyhow::bail!(
+                "field type mismatch for {:?} ({:?} vs {:?})",
+                field.id,
+                baseline,
+                current
+            )
+        }
+    })
 }
 
 fn write_field_value_naive(writer: &mut BitVecWriter, value: codec::FieldValue) -> Result<()> {
@@ -243,36 +398,52 @@ fn build_snapshot(tick: codec::SnapshotTick, states: &[DemoEntityState]) -> code
     codec::Snapshot { tick, entities }
 }
 
-fn demo_schema() -> schema::Schema {
+fn demo_schema(threshold_q: u32) -> schema::Schema {
+    let threshold = schema::ChangePolicy::Threshold { threshold_q };
     let component = schema::ComponentDef::new(component_id())
-        .field(schema::FieldDef::new(
-            field_id(1),
-            schema::FieldCodec::fixed_point(POS_MIN, POS_MAX, POS_SCALE),
-        ))
-        .field(schema::FieldDef::new(
-            field_id(2),
-            schema::FieldCodec::fixed_point(POS_MIN, POS_MAX, POS_SCALE),
-        ))
-        .field(schema::FieldDef::new(
-            field_id(3),
-            schema::FieldCodec::fixed_point(POS_MIN, POS_MAX, POS_SCALE),
-        ))
-        .field(schema::FieldDef::new(
-            field_id(4),
-            schema::FieldCodec::fixed_point(VEL_MIN, VEL_MAX, VEL_SCALE),
-        ))
-        .field(schema::FieldDef::new(
-            field_id(5),
-            schema::FieldCodec::fixed_point(VEL_MIN, VEL_MAX, VEL_SCALE),
-        ))
-        .field(schema::FieldDef::new(
-            field_id(6),
-            schema::FieldCodec::fixed_point(VEL_MIN, VEL_MAX, VEL_SCALE),
-        ))
-        .field(schema::FieldDef::new(
-            field_id(7),
-            schema::FieldCodec::uint(12),
-        ))
+        .field(
+            schema::FieldDef::new(
+                field_id(1),
+                schema::FieldCodec::fixed_point(POS_MIN, POS_MAX, POS_SCALE),
+            )
+            .change(threshold),
+        )
+        .field(
+            schema::FieldDef::new(
+                field_id(2),
+                schema::FieldCodec::fixed_point(POS_MIN, POS_MAX, POS_SCALE),
+            )
+            .change(threshold),
+        )
+        .field(
+            schema::FieldDef::new(
+                field_id(3),
+                schema::FieldCodec::fixed_point(POS_MIN, POS_MAX, POS_SCALE),
+            )
+            .change(threshold),
+        )
+        .field(
+            schema::FieldDef::new(
+                field_id(4),
+                schema::FieldCodec::fixed_point(VEL_MIN, VEL_MAX, VEL_SCALE),
+            )
+            .change(threshold),
+        )
+        .field(
+            schema::FieldDef::new(
+                field_id(5),
+                schema::FieldCodec::fixed_point(VEL_MIN, VEL_MAX, VEL_SCALE),
+            )
+            .change(threshold),
+        )
+        .field(
+            schema::FieldDef::new(
+                field_id(6),
+                schema::FieldCodec::fixed_point(VEL_MIN, VEL_MAX, VEL_SCALE),
+            )
+            .change(threshold),
+        )
+        .field(schema::FieldDef::new(field_id(7), schema::FieldCodec::uint(12)).change(threshold))
         .field(schema::FieldDef::new(
             field_id(8),
             schema::FieldCodec::bool(),
@@ -335,14 +506,20 @@ impl DemoEntityState {
     }
 }
 
-fn init_states(players: u32, rng: &mut Rng) -> Vec<DemoEntityState> {
+fn init_states(players: u32, rng: &mut Rng, world_size_q: i64) -> Vec<DemoEntityState> {
     let mut states = Vec::with_capacity(players as usize);
+    let grid = (players as f64).sqrt().ceil() as u32;
+    let spacing = (world_size_q / grid.max(1) as i64).max(1);
     for idx in 0..players {
         let id = codec::EntityId::new(idx + 1);
+        let row = idx / grid;
+        let col = idx % grid;
+        let base_x = (col as i64 * spacing) - world_size_q / 2;
+        let base_y = (row as i64 * spacing) - world_size_q / 2;
         let pos_q = [
-            rng.range_i64(POS_MIN / 2, POS_MAX / 2),
-            rng.range_i64(POS_MIN / 2, POS_MAX / 2),
-            rng.range_i64(POS_MIN / 2, POS_MAX / 2),
+            clamp(base_x + rng.range_i64(-50, 50), POS_MIN, POS_MAX),
+            clamp(base_y + rng.range_i64(-50, 50), POS_MIN, POS_MAX),
+            rng.range_i64(POS_MIN / 10, POS_MAX / 10),
         ];
         let vel_q = [
             rng.range_i64(VEL_MIN / 10, VEL_MAX / 10),
@@ -361,7 +538,22 @@ fn init_states(players: u32, rng: &mut Rng) -> Vec<DemoEntityState> {
     states
 }
 
-fn step_states(states: &mut [DemoEntityState], rng: &mut Rng, tick: u32, burst: Option<u32>) {
+fn step_states(states: &mut [DemoEntityState], rng: &mut Rng, tick: u32, cli: &Cli) {
+    match cli.scenario {
+        Scenario::Dense | Scenario::Visibility => step_dense(states, rng, tick, cli.burst_every),
+        Scenario::Idle => step_idle(states, rng, cli.idle_ratio, cli.jitter_amplitude_q),
+        Scenario::Burst => step_burst(
+            states,
+            rng,
+            tick,
+            cli.burst_every,
+            cli.burst_fraction,
+            cli.burst_amplitude_q,
+        ),
+    }
+}
+
+fn step_dense(states: &mut [DemoEntityState], rng: &mut Rng, tick: u32, burst: Option<u32>) {
     let burst_now = burst.is_some_and(|every| every > 0 && tick % every == 0);
     for state in states {
         for axis in 0..3 {
@@ -386,8 +578,332 @@ fn step_states(states: &mut [DemoEntityState], rng: &mut Rng, tick: u32, burst: 
     }
 }
 
+fn step_idle(states: &mut [DemoEntityState], rng: &mut Rng, idle_ratio: f32, jitter_q: i64) {
+    for state in states {
+        let idle = (rng.next_u32() as f32 / u32::MAX as f32) < idle_ratio;
+        if idle {
+            for axis in 0..3 {
+                let delta = rng.range_i64(-jitter_q, jitter_q);
+                state.pos_q[axis] = clamp(state.pos_q[axis] + delta, POS_MIN, POS_MAX);
+                let vel_delta = rng.range_i64(-jitter_q, jitter_q);
+                state.vel_q[axis] = clamp(state.vel_q[axis] + vel_delta, VEL_MIN, VEL_MAX);
+            }
+            let yaw_delta = rng.range_i64(-jitter_q, jitter_q);
+            state.yaw = ((state.yaw as i64 + yaw_delta).rem_euclid(4096)) as u16;
+        } else {
+            for axis in 0..3 {
+                if rng.next_u32() % 20 == 0 {
+                    let delta = rng.range_i64(-50, 50);
+                    state.vel_q[axis] = clamp(state.vel_q[axis] + delta, VEL_MIN, VEL_MAX);
+                }
+                state.pos_q[axis] = clamp(state.pos_q[axis] + state.vel_q[axis], POS_MIN, POS_MAX);
+                if state.pos_q[axis] == POS_MIN || state.pos_q[axis] == POS_MAX {
+                    state.vel_q[axis] = -state.vel_q[axis];
+                }
+            }
+            state.yaw = ((state.yaw as u32 + (rng.next_u32() % 13)) % 4096) as u16;
+        }
+    }
+}
+
+fn step_burst(
+    states: &mut [DemoEntityState],
+    rng: &mut Rng,
+    tick: u32,
+    burst_every: Option<u32>,
+    burst_fraction: f32,
+    burst_amplitude_q: i64,
+) {
+    step_dense(states, rng, tick, None);
+    let burst_now = burst_every.is_some_and(|every| every > 0 && tick % every == 0);
+    if !burst_now {
+        return;
+    }
+    for state in states {
+        let burst = (rng.next_u32() as f32 / u32::MAX as f32) < burst_fraction;
+        if burst {
+            for axis in 0..3 {
+                let delta = if rng.next_u32() % 2 == 0 {
+                    burst_amplitude_q
+                } else {
+                    -burst_amplitude_q
+                };
+                state.pos_q[axis] = clamp(state.pos_q[axis] + delta, POS_MIN, POS_MAX);
+            }
+            state.yaw = ((state.yaw as i64 + burst_amplitude_q).rem_euclid(4096)) as u16;
+            state.flags[0] = !state.flags[0];
+        }
+    }
+}
+
+fn run_visibility(
+    schema: &schema::Schema,
+    states: &[DemoEntityState],
+    tick: u32,
+    baselines: &mut [codec::Snapshot],
+    scratch: &mut CodecScratch,
+    radius_q: i64,
+    stats: &mut PerClientStats,
+) -> Result<()> {
+    let radius_sq = radius_q * radius_q;
+    for (idx, baseline) in baselines.iter_mut().enumerate() {
+        let observer = &states[idx % states.len()];
+        let relevant: Vec<DemoEntityState> = states
+            .iter()
+            .filter(|state| {
+                let dx = state.pos_q[0] - observer.pos_q[0];
+                let dy = state.pos_q[1] - observer.pos_q[1];
+                dx * dx + dy * dy <= radius_sq
+            })
+            .cloned()
+            .collect();
+        let snapshot = build_snapshot(codec::SnapshotTick::new(tick), &relevant);
+        stats.full_bincode_total += encode_bincode_snapshot(&relevant)? as u64;
+
+        if tick > 1 {
+            let start = Instant::now();
+            let delta_bytes = encode_delta_with_scratch(
+                schema,
+                baseline,
+                &snapshot,
+                &CodecLimits::default(),
+                scratch,
+            )?;
+            let elapsed = start.elapsed();
+            stats
+                .sdec
+                .add(delta_bytes.len() as u64, elapsed.as_micros() as u64);
+            let naive_bytes = encode_naive_delta(schema, baseline, &snapshot)?;
+            stats.naive.add(naive_bytes as u64, 0);
+        }
+
+        *baseline = snapshot;
+    }
+    Ok(())
+}
+
 fn clamp(value: i64, min: i64, max: i64) -> i64 {
     value.min(max).max(min)
+}
+
+#[derive(Default)]
+struct EncoderStats {
+    sizes: Vec<u64>,
+    encode_us: Vec<u64>,
+    total_bytes: u64,
+    count: u32,
+}
+
+impl EncoderStats {
+    fn add(&mut self, bytes: u64, encode_us: u64) {
+        self.total_bytes += bytes;
+        self.count += 1;
+        self.sizes.push(bytes);
+        if encode_us > 0 {
+            self.encode_us.push(encode_us);
+        }
+    }
+
+    fn finalize(&mut self) -> EncoderSummary {
+        let avg = if self.count > 0 {
+            self.total_bytes / self.count as u64
+        } else {
+            0
+        };
+        let p95_value = if self.sizes.is_empty() {
+            0
+        } else {
+            p95(&mut self.sizes)
+        };
+        let avg_encode = if self.encode_us.is_empty() {
+            0
+        } else {
+            self.encode_us.iter().sum::<u64>() / self.encode_us.len() as u64
+        };
+        let p95_encode = if self.encode_us.is_empty() {
+            0
+        } else {
+            p95(&mut self.encode_us)
+        };
+        EncoderSummary {
+            delta_count: self.count,
+            delta_bytes_total: self.total_bytes,
+            delta_avg: avg,
+            delta_p95: p95_value,
+            encode_us_avg: avg_encode,
+            encode_us_p95: p95_encode,
+        }
+    }
+}
+
+struct PerClientStats {
+    clients: u32,
+    sdec: EncoderStats,
+    naive: EncoderStats,
+    full_bincode_total: u64,
+}
+
+impl PerClientStats {
+    fn new(clients: u32) -> Self {
+        Self {
+            clients,
+            sdec: EncoderStats::default(),
+            naive: EncoderStats::default(),
+            full_bincode_total: 0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Summary {
+    scenario: ScenarioConfig,
+    sdec: EncoderSummary,
+    delta_naive: EncoderSummary,
+    full_bincode: FullSummary,
+    per_client: Option<PerClientSummary>,
+}
+
+impl Summary {
+    fn new(
+        cli: &Cli,
+        full_count: u32,
+        full_bytes_total: u64,
+        full_bincode_bytes_total: u64,
+        mut sdec: EncoderStats,
+        mut naive: EncoderStats,
+        per_client_stats: Option<PerClientStats>,
+    ) -> Self {
+        let sdec_summary = sdec.finalize();
+        let naive_summary = naive.finalize();
+        let avg_full = if cli.ticks > 0 {
+            full_bytes_total / cli.ticks as u64
+        } else {
+            0
+        };
+        let avg_bincode = if cli.ticks > 0 {
+            full_bincode_bytes_total / cli.ticks as u64
+        } else {
+            0
+        };
+        let per_client = per_client_stats.map(|mut stats| {
+            let sdec_summary = stats.sdec.finalize();
+            let naive_summary = stats.naive.finalize();
+            let denom = stats.clients.max(1) as u64 * cli.ticks as u64;
+            PerClientSummary {
+                clients: stats.clients,
+                sdec_avg_per_client: sdec_summary.delta_avg,
+                naive_avg_per_client: naive_summary.delta_avg,
+                full_bincode_avg_per_client: stats.full_bincode_total / denom,
+            }
+        });
+
+        Summary {
+            scenario: ScenarioConfig::from(cli),
+            sdec: sdec_summary,
+            delta_naive: naive_summary,
+            full_bincode: FullSummary {
+                full_count,
+                full_bytes_total,
+                full_bincode_bytes_total,
+                avg_full_bytes: avg_full,
+                avg_full_bincode_bytes: avg_bincode,
+            },
+            per_client,
+        }
+    }
+
+    fn assert_budgets(&self, max_p95: Option<u64>, max_avg: Option<u64>) -> Result<()> {
+        if let Some(max_p95) = max_p95 {
+            if self.sdec.delta_p95 > max_p95 {
+                anyhow::bail!(
+                    "p95 delta bytes {} exceeds budget {}",
+                    self.sdec.delta_p95,
+                    max_p95
+                );
+            }
+        }
+        if let Some(max_avg) = max_avg {
+            if self.sdec.delta_avg > max_avg {
+                anyhow::bail!(
+                    "avg delta bytes {} exceeds budget {}",
+                    self.sdec.delta_avg,
+                    max_avg
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ScenarioConfig {
+    name: Scenario,
+    players: u32,
+    ticks: u32,
+    seed: u64,
+    idle_ratio: f32,
+    jitter_amplitude_q: i64,
+    threshold_q: u32,
+    burst_every: Option<u32>,
+    burst_fraction: f32,
+    burst_amplitude_q: i64,
+    clients: u32,
+    visibility_radius_q: i64,
+    world_size_q: i64,
+}
+
+impl From<&Cli> for ScenarioConfig {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            name: cli.scenario,
+            players: cli.players,
+            ticks: cli.ticks,
+            seed: cli.seed,
+            idle_ratio: cli.idle_ratio,
+            jitter_amplitude_q: cli.jitter_amplitude_q,
+            threshold_q: cli.threshold_q,
+            burst_every: cli.burst_every,
+            burst_fraction: cli.burst_fraction,
+            burst_amplitude_q: cli.burst_amplitude_q,
+            clients: cli.clients,
+            visibility_radius_q: cli.visibility_radius_q,
+            world_size_q: cli.world_size_q,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EncoderSummary {
+    delta_count: u32,
+    delta_bytes_total: u64,
+    delta_avg: u64,
+    delta_p95: u64,
+    encode_us_avg: u64,
+    encode_us_p95: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FullSummary {
+    full_count: u32,
+    full_bytes_total: u64,
+    full_bincode_bytes_total: u64,
+    avg_full_bytes: u64,
+    avg_full_bincode_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PerClientSummary {
+    clients: u32,
+    sdec_avg_per_client: u64,
+    naive_avg_per_client: u64,
+    full_bincode_avg_per_client: u64,
+}
+
+fn p95(values: &mut [u64]) -> u64 {
+    values.sort_unstable();
+    let idx = ((values.len() as f64) * 0.95).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(values.len() - 1);
+    values[idx]
 }
 
 struct Rng {
@@ -409,104 +925,6 @@ impl Rng {
         let value = (self.next_u32() as u64) % span;
         min + value as i64
     }
-}
-
-#[derive(Debug, Serialize)]
-struct Summary {
-    players: u32,
-    ticks: u32,
-    seed: u64,
-    burst_every: Option<u32>,
-    full_count: u32,
-    delta_count: u32,
-    full_bytes_total: u64,
-    delta_bytes_total: u64,
-    full_bincode_bytes_total: u64,
-    delta_naive_bytes_total: u64,
-    avg_bytes_per_tick: u64,
-    avg_delta_bytes: u64,
-    p95_delta_bytes: u64,
-    avg_full_bincode_bytes: u64,
-    avg_delta_naive_bytes: u64,
-    avg_encode_us: u64,
-    p95_encode_us: u64,
-    #[serde(skip)]
-    delta_sizes: Vec<u64>,
-    #[serde(skip)]
-    encode_us: Vec<u64>,
-}
-
-impl Summary {
-    fn new(players: u32, ticks: u32, seed: u64, burst_every: Option<u32>) -> Self {
-        Self {
-            players,
-            ticks,
-            seed,
-            burst_every,
-            full_count: 0,
-            delta_count: 0,
-            full_bytes_total: 0,
-            delta_bytes_total: 0,
-            full_bincode_bytes_total: 0,
-            delta_naive_bytes_total: 0,
-            avg_bytes_per_tick: 0,
-            avg_delta_bytes: 0,
-            p95_delta_bytes: 0,
-            avg_full_bincode_bytes: 0,
-            avg_delta_naive_bytes: 0,
-            avg_encode_us: 0,
-            p95_encode_us: 0,
-            delta_sizes: Vec::new(),
-            encode_us: Vec::new(),
-        }
-    }
-
-    fn finalize(&mut self) {
-        if self.ticks > 0 {
-            self.avg_bytes_per_tick =
-                (self.full_bytes_total + self.delta_bytes_total) / self.ticks as u64;
-            self.avg_full_bincode_bytes = self.full_bincode_bytes_total / self.ticks as u64;
-        }
-        if self.delta_count > 0 {
-            self.avg_delta_bytes = self.delta_bytes_total / self.delta_count as u64;
-            self.p95_delta_bytes = p95(&mut self.delta_sizes);
-            self.avg_delta_naive_bytes = self.delta_naive_bytes_total / self.delta_count as u64;
-        }
-        if !self.encode_us.is_empty() {
-            let total: u64 = self.encode_us.iter().sum();
-            self.avg_encode_us = total / self.encode_us.len() as u64;
-            self.p95_encode_us = p95(&mut self.encode_us);
-        }
-    }
-
-    fn assert_budgets(&self, max_p95: Option<u64>, max_avg: Option<u64>) -> Result<()> {
-        if let Some(max_p95) = max_p95 {
-            if self.p95_delta_bytes > max_p95 {
-                anyhow::bail!(
-                    "p95 delta bytes {} exceeds budget {}",
-                    self.p95_delta_bytes,
-                    max_p95
-                );
-            }
-        }
-        if let Some(max_avg) = max_avg {
-            if self.avg_delta_bytes > max_avg {
-                anyhow::bail!(
-                    "avg delta bytes {} exceeds budget {}",
-                    self.avg_delta_bytes,
-                    max_avg
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-fn p95(values: &mut [u64]) -> u64 {
-    values.sort_unstable();
-    let idx = ((values.len() as f64) * 0.95).ceil() as usize;
-    let idx = idx.saturating_sub(1).min(values.len() - 1);
-    values[idx]
 }
 
 #[derive(Debug, Serialize)]
