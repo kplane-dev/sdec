@@ -16,12 +16,18 @@ mod error;
 mod header;
 mod limits;
 mod packet;
+mod session;
 
 pub use error::{DecodeError, EncodeError, LimitKind, SectionFramingError, WireResult};
 pub use header::{PacketFlags, PacketHeader, HEADER_SIZE, MAGIC, VERSION};
 pub use limits::Limits;
 pub use packet::{
-    decode_packet, encode_header, encode_section, SectionTag, WirePacket, WireSection,
+    decode_packet, decode_sections, encode_header, encode_section, SectionTag, WirePacket,
+    WireSection,
+};
+pub use session::{
+    decode_session_header, encode_session_header, SessionFlags, SessionHeader,
+    SESSION_MAX_HEADER_SIZE,
 };
 
 #[cfg(test)]
@@ -39,6 +45,8 @@ mod tests {
         let _ = PacketHeader::full_snapshot(0, 0, 0);
         let _ = Limits::default();
         let _ = SectionTag::EntityCreate;
+        let _ = SessionFlags::full_snapshot();
+        let _ = SESSION_MAX_HEADER_SIZE;
 
         // Error types
         let _: WireResult<()> = Ok(());

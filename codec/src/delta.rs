@@ -102,6 +102,31 @@ pub fn encode_delta_snapshot_for_client(
     )
 }
 
+/// Encodes a client delta snapshot using a compact session header.
+pub fn encode_delta_snapshot_for_client_session(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    last_tick: &mut SnapshotTick,
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    let mut scratch = CodecScratch::default();
+    encode_delta_snapshot_for_client_session_with_scratch(
+        schema,
+        tick,
+        baseline_tick,
+        baseline,
+        current,
+        limits,
+        &mut scratch,
+        last_tick,
+        out,
+    )
+}
+
 /// Encodes a delta snapshot for a client-specific view using reusable scratch buffers.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_delta_snapshot_for_client_with_scratch(
@@ -133,6 +158,70 @@ enum EncodeUpdateMode {
     Sparse,
 }
 
+/// Encodes a client delta snapshot using a compact session header.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_delta_snapshot_for_client_session_with_scratch(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+    last_tick: &mut SnapshotTick,
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    let max_header = wire::SESSION_MAX_HEADER_SIZE;
+    if out.len() < max_header {
+        return Err(CodecError::OutputTooSmall {
+            needed: max_header,
+            available: out.len(),
+        });
+    }
+    if tick.raw() <= last_tick.raw() {
+        return Err(CodecError::InvalidEntityOrder {
+            previous: last_tick.raw(),
+            current: tick.raw(),
+        });
+    }
+    if baseline_tick.raw() > tick.raw() {
+        return Err(CodecError::BaselineTickMismatch {
+            expected: baseline_tick.raw(),
+            found: tick.raw(),
+        });
+    }
+    let payload_len = encode_delta_payload_with_mode(
+        schema,
+        baseline_tick,
+        baseline,
+        current,
+        limits,
+        scratch,
+        &mut out[max_header..],
+        EncodeUpdateMode::Sparse,
+    )?;
+    let tick_delta = tick.raw() - last_tick.raw();
+    let baseline_delta = tick.raw() - baseline_tick.raw();
+    let header_len = wire::encode_session_header(
+        &mut out[..max_header],
+        wire::SessionFlags::delta_snapshot(),
+        tick_delta,
+        baseline_delta,
+        payload_len as u32,
+    )
+    .map_err(|_| CodecError::OutputTooSmall {
+        needed: max_header,
+        available: out.len(),
+    })?;
+    if header_len < max_header {
+        let payload_start = max_header;
+        let payload_end = max_header + payload_len;
+        out.copy_within(payload_start..payload_end, header_len);
+    }
+    *last_tick = tick;
+    Ok(header_len + payload_len)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_delta_snapshot_with_scratch_mode(
     schema: &schema::Schema,
@@ -151,7 +240,43 @@ fn encode_delta_snapshot_with_scratch_mode(
             available: out.len(),
         });
     }
+    let payload_len = encode_delta_payload_with_mode(
+        schema,
+        baseline_tick,
+        baseline,
+        current,
+        limits,
+        scratch,
+        &mut out[wire::HEADER_SIZE..],
+        mode,
+    )?;
+    let header = wire::PacketHeader::delta_snapshot(
+        schema_hash(schema),
+        tick.raw(),
+        baseline_tick.raw(),
+        payload_len as u32,
+    );
+    encode_header(&header, &mut out[..wire::HEADER_SIZE]).map_err(|_| {
+        CodecError::OutputTooSmall {
+            needed: wire::HEADER_SIZE,
+            available: out.len(),
+        }
+    })?;
 
+    Ok(wire::HEADER_SIZE + payload_len)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_delta_payload_with_mode(
+    schema: &schema::Schema,
+    baseline_tick: SnapshotTick,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+    out: &mut [u8],
+    mode: EncodeUpdateMode,
+) -> CodecResult<usize> {
     if baseline.tick != baseline_tick {
         return Err(CodecError::BaselineTickMismatch {
             expected: baseline.tick.raw(),
@@ -187,7 +312,7 @@ fn encode_delta_snapshot_with_scratch_mode(
         });
     }
 
-    let mut offset = wire::HEADER_SIZE;
+    let mut offset = 0;
     if counts.destroys > 0 {
         let written = write_section(
             SectionTag::EntityDestroy,
@@ -245,20 +370,6 @@ fn encode_delta_snapshot_with_scratch_mode(
             )?;
         offset += written;
     }
-
-    let payload_len = offset - wire::HEADER_SIZE;
-    let header = wire::PacketHeader::delta_snapshot(
-        schema_hash(schema),
-        tick.raw(),
-        baseline_tick.raw(),
-        payload_len as u32,
-    );
-    encode_header(&header, &mut out[..wire::HEADER_SIZE]).map_err(|_| {
-        CodecError::OutputTooSmall {
-            needed: wire::HEADER_SIZE,
-            available: out.len(),
-        }
-    })?;
 
     Ok(offset)
 }
@@ -2505,6 +2616,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied.entities, current.entities);
+    }
+
+    #[test]
+    fn delta_session_header_matches_payload() {
+        let schema = schema_one_bool();
+        let baseline = baseline_snapshot();
+        let current = Snapshot {
+            tick: SnapshotTick::new(11),
+            entities: vec![EntitySnapshot {
+                id: EntityId::new(1),
+                components: vec![ComponentSnapshot {
+                    id: ComponentId::new(1).unwrap(),
+                    fields: vec![FieldValue::Bool(true)],
+                }],
+            }],
+        };
+
+        let mut full_buf = [0u8; 128];
+        let full_bytes = encode_delta_snapshot_for_client(
+            &schema,
+            current.tick,
+            baseline.tick,
+            &baseline,
+            &current,
+            &CodecLimits::for_testing(),
+            &mut full_buf,
+        )
+        .unwrap();
+        let full_payload = &full_buf[wire::HEADER_SIZE..full_bytes];
+
+        let mut session_buf = [0u8; 128];
+        let mut last_tick = baseline.tick;
+        let session_bytes = encode_delta_snapshot_for_client_session_with_scratch(
+            &schema,
+            current.tick,
+            baseline.tick,
+            &baseline,
+            &current,
+            &CodecLimits::for_testing(),
+            &mut CodecScratch::default(),
+            &mut last_tick,
+            &mut session_buf,
+        )
+        .unwrap();
+
+        let session_header =
+            wire::decode_session_header(&session_buf[..session_bytes], baseline.tick.raw())
+                .unwrap();
+        let payload_start = session_header.header_len;
+        let payload_end = payload_start + session_header.payload_len as usize;
+        let session_payload = &session_buf[payload_start..payload_end];
+        assert_eq!(full_payload, session_payload);
     }
 
     #[test]

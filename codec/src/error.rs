@@ -91,6 +91,18 @@ pub enum CodecError {
         /// The existing entity ID.
         entity_id: u32,
     },
+
+    /// Missing session state for compact packets.
+    SessionMissing,
+
+    /// Session init packet was invalid.
+    SessionInitInvalid,
+
+    /// Session compact header mode is unsupported.
+    SessionUnsupportedMode { mode: u8 },
+
+    /// Session packets arrived out of order.
+    SessionOutOfOrder { previous: u32, current: u32 },
 }
 
 /// Specific limit that was exceeded.
@@ -231,6 +243,18 @@ impl fmt::Display for CodecError {
             }
             Self::EntityAlreadyExists { entity_id } => {
                 write!(f, "entity {entity_id} already exists")
+            }
+            Self::SessionMissing => {
+                write!(f, "session state missing for compact packet")
+            }
+            Self::SessionInitInvalid => {
+                write!(f, "session init packet invalid")
+            }
+            Self::SessionUnsupportedMode { mode } => {
+                write!(f, "session compact mode {mode} unsupported")
+            }
+            Self::SessionOutOfOrder { previous, current } => {
+                write!(f, "session packet out of order: {previous} then {current}")
             }
         }
     }

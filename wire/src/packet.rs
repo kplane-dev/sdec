@@ -14,6 +14,7 @@ pub enum SectionTag {
     EntityUpdate = 3,
     EntityUpdateSparse = 4,
     EntityUpdateSparsePacked = 5,
+    SessionInit = 6,
 }
 
 impl SectionTag {
@@ -25,6 +26,7 @@ impl SectionTag {
             3 => Ok(Self::EntityUpdate),
             4 => Ok(Self::EntityUpdateSparse),
             5 => Ok(Self::EntityUpdateSparsePacked),
+            6 => Ok(Self::SessionInit),
             _ => Err(DecodeError::UnknownSectionTag { tag }),
         }
     }
@@ -72,7 +74,7 @@ pub fn decode_packet<'a>(buf: &'a [u8], limits: &Limits) -> WireResult<WirePacke
 
     let flags_raw = u16::from_le_bytes(buf[6..8].try_into().unwrap());
     let flags = PacketFlags::from_raw(flags_raw);
-    if !flags.is_valid_v0() {
+    if !flags.is_valid_v2() {
         return Err(DecodeError::InvalidFlags { flags: flags_raw });
     }
 
@@ -81,13 +83,13 @@ pub fn decode_packet<'a>(buf: &'a [u8], limits: &Limits) -> WireResult<WirePacke
     let baseline_tick = u32::from_le_bytes(buf[20..24].try_into().unwrap());
     let payload_len = u32::from_le_bytes(buf[24..28].try_into().unwrap());
 
-    if flags.is_full_snapshot() && baseline_tick != 0 {
+    if !flags.is_session_init() && flags.is_full_snapshot() && baseline_tick != 0 {
         return Err(DecodeError::InvalidBaselineTick {
             baseline_tick,
             flags: flags_raw,
         });
     }
-    if flags.is_delta_snapshot() && baseline_tick == 0 {
+    if !flags.is_session_init() && flags.is_delta_snapshot() && baseline_tick == 0 {
         return Err(DecodeError::InvalidBaselineTick {
             baseline_tick,
             flags: flags_raw,
@@ -112,6 +114,13 @@ pub fn decode_packet<'a>(buf: &'a [u8], limits: &Limits) -> WireResult<WirePacke
     };
 
     let payload = &buf[HEADER_SIZE..];
+    let sections = decode_sections(payload, limits)?;
+
+    Ok(WirePacket { header, sections })
+}
+
+/// Decodes sections from a payload buffer (no packet header).
+pub fn decode_sections<'a>(payload: &'a [u8], limits: &Limits) -> WireResult<Vec<WireSection<'a>>> {
     let mut offset = 0usize;
     let mut sections = Vec::new();
 
@@ -152,7 +161,7 @@ pub fn decode_packet<'a>(buf: &'a [u8], limits: &Limits) -> WireResult<WirePacke
         offset += len_usize;
     }
 
-    Ok(WirePacket { header, sections })
+    Ok(sections)
 }
 
 /// Encodes a packet header into the provided output buffer.
@@ -338,6 +347,18 @@ mod tests {
         let limits = Limits::for_testing();
         let err = decode_packet(&buf, &limits).unwrap_err();
         assert!(matches!(err, DecodeError::InvalidFlags { .. }));
+    }
+
+    #[test]
+    fn decode_accepts_session_init_flags() {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        buf[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        let flags = PacketFlags::session_init().raw();
+        buf[6..8].copy_from_slice(&flags.to_le_bytes());
+        let limits = Limits::for_testing();
+        let packet = decode_packet(&buf, &limits).unwrap();
+        assert!(packet.header.flags.is_session_init());
     }
 
     #[test]

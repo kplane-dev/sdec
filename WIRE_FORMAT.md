@@ -59,8 +59,10 @@ Flags are a bitset:
 
 - `FULL_SNAPSHOT` (bit 0): payload contains a full snapshot.
 - `DELTA_SNAPSHOT` (bit 1): payload contains a delta snapshot.
+- `SESSION_INIT` (bit 2): packet establishes session context.
 
-Exactly one of `FULL_SNAPSHOT` or `DELTA_SNAPSHOT` MUST be set in version 2.
+Exactly one of `FULL_SNAPSHOT` or `DELTA_SNAPSHOT` MUST be set in version 2, unless
+`SESSION_INIT` is set (in which case both are unset).
 
 Reserved bits:
 - bits 2..15 reserved for future use; MUST be zero in version 2.
@@ -94,6 +96,7 @@ Only the essential sections are defined.
 | 3   | `ENTITY_UPDATE`   | optional        | optional         | Update existing entities (masked updates). |
 | 4   | `ENTITY_UPDATE_SPARSE` | optional   | optional         | Update existing entities (sparse field list, varint indices). |
 | 5   | `ENTITY_UPDATE_SPARSE_PACKED` | optional | optional | Update existing entities (sparse field list, bit-packed indices). |
+| 6   | `SESSION_INIT`    | optional        | optional         | Session init body (session_id + compact mode). |
 
 Notes:
 - FULL snapshot can be represented as a set of creates + updates; however in the initial version we keep semantics simple:
@@ -158,6 +161,44 @@ Body:
 
 Encoding:
 - entity IDs MUST be unique within the section.
+
+---
+
+## Session Init Packet
+
+Session init packets establish session context. They use the standard header and
+include a `SESSION_INIT` flag.
+
+Body:
+- `session_id` (u64, optional; 0 means absent)
+- `compact_mode` (u8; currently `1` for session compact header v1)
+
+Rules:
+- `SESSION_INIT` MUST be set, and FULL/DELTA MUST be unset.
+- `baseline_tick` MUST be 0.
+- Packet MUST include exactly one `SESSION_INIT` section.
+
+---
+
+## Session Mode (compact header)
+
+For per-client replication, a compact session header can be used once schema/version
+have been negotiated out-of-band. This header replaces the standard packet header.
+
+Session header layout:
+- `flags` (u8)
+- `tick_delta` (varuint)
+- `baseline_delta` (varuint)
+- `payload_len` (varuint)
+
+Rules:
+- `tick_delta` MUST be > 0.
+- For full snapshots, `baseline_delta` MUST be 0.
+- For delta snapshots, `baseline_delta` MUST be > 0.
+- The receiver reconstructs `tick` as `last_tick + tick_delta`.
+- The receiver reconstructs `baseline_tick` as `tick - baseline_delta`.
+
+This reduces per-packet overhead for per-client deltas while keeping section framing unchanged.
 
 ---
 
