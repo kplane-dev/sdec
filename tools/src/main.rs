@@ -7,7 +7,11 @@ use glob::Pattern;
 use tools::{decode_packet_json, format_decode_pretty, inspect_packet};
 
 #[derive(Parser)]
-#[command(name = "sdec-tools", version, about = "sdec inspection and decoding tools")]
+#[command(
+    name = "sdec-tools",
+    version,
+    about = "sdec inspection and decoding tools"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -74,10 +78,7 @@ fn main() -> Result<()> {
             if packet_path.is_dir() {
                 let entries = collect_packet_entries(&packet_path, glob.as_deref())?;
                 let mut entries = maybe_sort_entries(entries, sort);
-                let limit = limit.or_else(|| match sort {
-                    Some(InspectSort::Size) => Some(10),
-                    None => None,
-                });
+                let limit = limit.or(sort.map(|InspectSort::Size| 10));
                 if let Some(limit) = limit {
                     entries.truncate(limit);
                 }
@@ -136,8 +137,7 @@ fn main() -> Result<()> {
 fn load_schema(path: &PathBuf) -> Result<schema::Schema> {
     let contents =
         fs::read_to_string(path).with_context(|| format!("read schema {}", path.display()))?;
-    let schema: schema::Schema =
-        serde_json::from_str(&contents).context("parse schema json")?;
+    let schema: schema::Schema = serde_json::from_str(&contents).context("parse schema json")?;
     schema
         .validate()
         .map_err(|err| anyhow::anyhow!("schema validation failed: {err:?}"))?;
@@ -173,7 +173,10 @@ fn collect_packet_entries(dir: &PathBuf, glob: Option<&str>) -> Result<Vec<Packe
     Ok(entries)
 }
 
-fn maybe_sort_entries(mut entries: Vec<PacketEntry>, sort: Option<InspectSort>) -> Vec<PacketEntry> {
+fn maybe_sort_entries(
+    mut entries: Vec<PacketEntry>,
+    sort: Option<InspectSort>,
+) -> Vec<PacketEntry> {
     match sort {
         Some(InspectSort::Size) => {
             entries.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
@@ -202,10 +205,7 @@ fn print_inspect_report(report: &tools::InspectReport) {
             .entity_count
             .map(|count| format!("{count} entities"))
             .unwrap_or_else(|| "count n/a".to_string());
-        println!(
-            "  {tag}: {count} ({} bytes)",
-            section.byte_len
-        );
+        println!("  {tag}: {count} ({} bytes)", section.byte_len);
     }
     if let Some(summary) = &report.update_summary {
         println!("update summary:");

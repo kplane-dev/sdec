@@ -157,7 +157,10 @@ pub fn format_decode_pretty(output: &DecodeOutput) -> String {
             for component in &entity.components {
                 lines.push(format!("    component {}", component.id));
                 for field in &component.fields {
-                    lines.push(format!("      field[{}] = {}", field.index, field.value.value));
+                    lines.push(format!(
+                        "      field[{}] = {}",
+                        field.index, field.value.value
+                    ));
                 }
             }
         }
@@ -250,7 +253,9 @@ pub fn build_decode_output(
             delta_snapshot: Some(delta_snapshot_output(&delta)),
         })
     } else {
-        Err(anyhow::anyhow!("packet flags do not indicate snapshot type"))
+        Err(anyhow::anyhow!(
+            "packet flags do not indicate snapshot type"
+        ))
     }
 }
 
