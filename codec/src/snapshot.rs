@@ -158,14 +158,14 @@ pub fn decode_full_snapshot_from_packet(
     })
 }
 
-fn write_section<F>(
+pub(crate) fn write_section<F>(
     tag: SectionTag,
     out: &mut [u8],
     limits: &CodecLimits,
     write_body: F,
 ) -> CodecResult<usize>
 where
-    F: FnOnce(&mut BitWriter<'_>) -> CodecResult<usize>,
+    F: FnOnce(&mut BitWriter<'_>) -> CodecResult<()>,
 {
     if out.len() < 1 + VARINT_MAX_BYTES {
         return Err(CodecError::OutputTooSmall {
@@ -175,11 +175,9 @@ where
     }
 
     let body_start = 1 + VARINT_MAX_BYTES;
-    out[body_start..].fill(0);
     let mut writer = BitWriter::new(&mut out[body_start..]);
-    let body_len = write_body(&mut writer)?;
-    let used_bytes = writer.finish();
-    let body_len = body_len.max(used_bytes);
+    write_body(&mut writer)?;
+    let body_len = writer.finish();
 
     if body_len > limits.max_section_bytes {
         return Err(CodecError::LimitsExceeded {
@@ -217,7 +215,7 @@ fn encode_create_body(
     entities: &[EntitySnapshot],
     limits: &CodecLimits,
     writer: &mut BitWriter<'_>,
-) -> CodecResult<usize> {
+) -> CodecResult<()> {
     if schema.components.len() > limits.max_components_per_entity {
         return Err(CodecError::LimitsExceeded {
             kind: LimitKind::ComponentsPerEntity,
@@ -264,8 +262,7 @@ fn encode_create_body(
     }
 
     writer.align_to_byte()?;
-
-    Ok(writer.bits_written().div_ceil(8))
+    Ok(())
 }
 
 fn write_component_mask(
@@ -322,7 +319,7 @@ fn write_component_fields(
     Ok(())
 }
 
-fn write_field_value(
+pub(crate) fn write_field_value(
     component_id: ComponentId,
     field: FieldDef,
     value: FieldValue,
@@ -513,7 +510,7 @@ fn decode_component_fields(
     Ok(values)
 }
 
-fn read_field_value(
+pub(crate) fn read_field_value(
     component_id: ComponentId,
     field: FieldDef,
     reader: &mut BitReader<'_>,
@@ -565,7 +562,7 @@ fn read_field_value(
     }
 }
 
-fn read_mask(
+pub(crate) fn read_mask(
     reader: &mut BitReader<'_>,
     expected_bits: usize,
     kind: MaskKind,
@@ -587,7 +584,10 @@ fn read_mask(
     Ok(mask)
 }
 
-fn ensure_known_components(schema: &schema::Schema, entity: &EntitySnapshot) -> CodecResult<()> {
+pub(crate) fn ensure_known_components(
+    schema: &schema::Schema,
+    entity: &EntitySnapshot,
+) -> CodecResult<()> {
     for component in &entity.components {
         if schema.components.iter().all(|c| c.id != component.id) {
             return Err(CodecError::InvalidMask {
@@ -665,7 +665,7 @@ fn decode_sint(bits: u8, raw: u64) -> CodecResult<i64> {
     }
 }
 
-fn required_bits(range: u64) -> u8 {
+pub(crate) fn required_bits(range: u64) -> u8 {
     if range == 0 {
         return 0;
     }
@@ -885,15 +885,27 @@ mod tests {
         let limits = CodecLimits::for_testing();
         let count = (limits.max_entities_create as u32) + 1;
 
-        let mut buf = [0u8; wire::HEADER_SIZE + 3];
-        let header = wire::PacketHeader::full_snapshot(schema_hash(&schema), 1, 3);
+        let mut body = [0u8; 8];
+        write_varu32(count, &mut body);
+        let body_len = varu32_len(count);
+        let mut section_buf = [0u8; 16];
+        let section_len = wire::encode_section(
+            SectionTag::EntityCreate,
+            &body[..body_len],
+            &mut section_buf,
+        )
+        .unwrap();
+
+        let payload_len = section_len as u32;
+        let header = wire::PacketHeader::full_snapshot(schema_hash(&schema), 1, payload_len);
+        let mut buf = [0u8; wire::HEADER_SIZE + 16];
         encode_header(&header, &mut buf[..wire::HEADER_SIZE]).unwrap();
-        buf[wire::HEADER_SIZE] = SectionTag::EntityCreate as u8;
-        buf[wire::HEADER_SIZE + 1] = 1; // section body length
-        buf[wire::HEADER_SIZE + 2] = count as u8;
+        buf[wire::HEADER_SIZE..wire::HEADER_SIZE + section_len]
+            .copy_from_slice(&section_buf[..section_len]);
+        let buf = &buf[..wire::HEADER_SIZE + section_len];
 
         let err =
-            decode_full_snapshot(&schema, &buf, &wire::Limits::for_testing(), &limits).unwrap_err();
+            decode_full_snapshot(&schema, buf, &wire::Limits::for_testing(), &limits).unwrap_err();
         assert!(matches!(
             err,
             CodecError::LimitsExceeded {
