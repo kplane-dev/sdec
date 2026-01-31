@@ -22,18 +22,26 @@ mod delta;
 mod error;
 mod limits;
 mod scratch;
+mod session;
 mod snapshot;
 mod types;
 
 pub use baseline::{BaselineError, BaselineStore};
 pub use delta::{
     apply_delta_snapshot, apply_delta_snapshot_from_packet, decode_delta_packet,
-    encode_delta_snapshot, encode_delta_snapshot_with_scratch, select_baseline_tick, DeltaDecoded,
-    DeltaUpdateComponent, DeltaUpdateEntity,
+    encode_delta_snapshot, encode_delta_snapshot_for_client,
+    encode_delta_snapshot_for_client_session,
+    encode_delta_snapshot_for_client_session_with_scratch,
+    encode_delta_snapshot_for_client_with_scratch, encode_delta_snapshot_with_scratch,
+    select_baseline_tick, DeltaDecoded, DeltaUpdateComponent, DeltaUpdateEntity,
 };
 pub use error::{CodecError, CodecResult, LimitKind, MaskKind, MaskReason, ValueReason};
 pub use limits::CodecLimits;
 pub use scratch::CodecScratch;
+pub use session::{
+    decode_session_init_packet, decode_session_packet, encode_session_init_packet,
+    CompactHeaderMode, SessionState,
+};
 pub use snapshot::{
     decode_full_snapshot, decode_full_snapshot_from_packet, encode_full_snapshot,
     ComponentSnapshot, EntitySnapshot, FieldValue, Snapshot,

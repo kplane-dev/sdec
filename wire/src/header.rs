@@ -6,7 +6,7 @@
 pub const MAGIC: u32 = 0x5344_4543; // "SDEC" in ASCII
 
 /// Current wire format version.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Header size in bytes (28 total).
 pub const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 4 + 4 + 4;
@@ -22,8 +22,11 @@ impl PacketFlags {
     /// Flag indicating a delta snapshot packet.
     pub const DELTA_SNAPSHOT: u16 = 1 << 1;
 
-    /// Reserved bits mask (must be zero in version 0).
-    const RESERVED_MASK: u16 = !0b11;
+    /// Flag indicating a session init packet.
+    pub const SESSION_INIT: u16 = 1 << 2;
+
+    /// Reserved bits mask (must be zero in version 2).
+    const RESERVED_MASK: u16 = !0b111;
 
     /// Creates new flags from a raw value.
     #[must_use]
@@ -59,7 +62,34 @@ impl PacketFlags {
         let has_delta = self.is_delta_snapshot();
         let has_reserved = self.0 & Self::RESERVED_MASK != 0;
 
-        (has_full ^ has_delta) && !has_reserved
+        has_full ^ has_delta && !has_reserved
+    }
+
+    /// Returns `true` if this is a session init packet.
+    #[must_use]
+    pub const fn is_session_init(self) -> bool {
+        self.0 & Self::SESSION_INIT != 0
+    }
+
+    /// Returns `true` if the flags are valid for version 2.
+    ///
+    /// Valid means either:
+    /// - session init set alone (no full/delta), or
+    /// - exactly one of full/delta set, with no session init,
+    ///   and no reserved bits are set.
+    #[must_use]
+    pub const fn is_valid_v2(self) -> bool {
+        let has_full = self.is_full_snapshot();
+        let has_delta = self.is_delta_snapshot();
+        let has_session = self.is_session_init();
+        let has_reserved = self.0 & Self::RESERVED_MASK != 0;
+        if has_reserved {
+            return false;
+        }
+        if has_session {
+            return !has_full && !has_delta;
+        }
+        has_full ^ has_delta
     }
 
     /// Creates flags for a full snapshot.
@@ -72,6 +102,12 @@ impl PacketFlags {
     #[must_use]
     pub const fn delta_snapshot() -> Self {
         Self(Self::DELTA_SNAPSHOT)
+    }
+
+    /// Creates flags for a session init packet.
+    #[must_use]
+    pub const fn session_init() -> Self {
+        Self(Self::SESSION_INIT)
     }
 }
 
@@ -145,8 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn version_is_one() {
-        assert_eq!(VERSION, 1);
+    fn version_is_two() {
+        assert_eq!(VERSION, 2);
     }
 
     #[test]
@@ -196,22 +232,22 @@ mod tests {
 
     #[test]
     fn flags_invalid_both_set() {
-        assert!(!PacketFlags::from_raw(0b11).is_valid_v0());
+        assert!(!PacketFlags::from_raw(0b11).is_valid_v2());
     }
 
     #[test]
     fn flags_invalid_reserved_bits() {
         // Full snapshot + reserved bit
-        assert!(!PacketFlags::from_raw(0b101).is_valid_v0());
+        assert!(!PacketFlags::from_raw(0b1001).is_valid_v2());
         // High bits set
-        assert!(!PacketFlags::from_raw(0xFF01).is_valid_v0());
+        assert!(!PacketFlags::from_raw(0xFF01).is_valid_v2());
     }
 
     #[test]
     fn flags_default() {
         let flags = PacketFlags::default();
         assert_eq!(flags.raw(), 0);
-        assert!(!flags.is_valid_v0()); // default is invalid (neither set)
+        assert!(!flags.is_valid_v2()); // default is invalid (neither set)
     }
 
     #[test]

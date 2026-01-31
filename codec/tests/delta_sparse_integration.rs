@@ -1,6 +1,6 @@
 use codec::{
-    apply_delta_snapshot_from_packet, encode_delta_snapshot, CodecLimits, ComponentSnapshot,
-    EntitySnapshot, FieldValue, Snapshot,
+    apply_delta_snapshot_from_packet, encode_delta_snapshot, encode_delta_snapshot_for_client,
+    CodecLimits, ComponentSnapshot, EntitySnapshot, FieldValue, Snapshot,
 };
 use schema::{ComponentDef, ComponentId, FieldCodec, FieldDef, FieldId, Schema};
 use wire::{decode_packet, Limits as WireLimits, SectionTag};
@@ -60,7 +60,7 @@ fn delta_selects_sparse_encoding_for_sparse_change() {
     assert!(packet
         .sections
         .iter()
-        .any(|section| section.tag == SectionTag::EntityUpdateSparse));
+        .any(|section| section.tag == SectionTag::EntityUpdateSparsePacked));
 
     let applied = apply_delta_snapshot_from_packet(&schema, &baseline, &packet, &limits).unwrap();
     assert_eq!(applied.entities, current.entities);
@@ -95,4 +95,42 @@ fn delta_selects_masked_encoding_for_dense_change() {
         .sections
         .iter()
         .any(|section| section.tag == SectionTag::EntityUpdate));
+}
+
+#[test]
+fn delta_for_client_uses_sparse_encoding() {
+    let schema = schema_with_uint_fields(16);
+    let baseline = Snapshot {
+        tick: codec::SnapshotTick::new(1),
+        entities: vec![entity_with_uint_fields(1, 16, 0)],
+    };
+    let mut current_entity = entity_with_uint_fields(1, 16, 0);
+    current_entity.components[0].fields[0] = FieldValue::UInt(1);
+    let current = Snapshot {
+        tick: codec::SnapshotTick::new(2),
+        entities: vec![current_entity.clone()],
+    };
+
+    let mut buf = [0u8; 512];
+    let bytes = encode_delta_snapshot_for_client(
+        &schema,
+        current.tick,
+        baseline.tick,
+        &baseline,
+        &current,
+        &CodecLimits::for_testing(),
+        &mut buf,
+    )
+    .unwrap();
+
+    let packet = decode_packet(&buf[..bytes], &WireLimits::for_testing()).unwrap();
+    assert!(packet
+        .sections
+        .iter()
+        .any(|section| section.tag == SectionTag::EntityUpdateSparsePacked));
+
+    let applied =
+        apply_delta_snapshot_from_packet(&schema, &baseline, &packet, &CodecLimits::for_testing())
+            .unwrap();
+    assert_eq!(applied.entities, current.entities);
 }

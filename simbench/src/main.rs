@@ -5,7 +5,10 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use bitstream::BitVecWriter;
 use clap::{Parser, ValueEnum};
-use codec::{encode_delta_snapshot_with_scratch, encode_full_snapshot, CodecLimits, CodecScratch};
+use codec::{
+    encode_delta_snapshot_for_client_session_with_scratch, encode_delta_snapshot_with_scratch,
+    encode_full_snapshot, CodecLimits, CodecScratch,
+};
 use serde::Serialize;
 use wire::Limits as WireLimits;
 
@@ -58,6 +61,15 @@ struct Cli {
     /// Output directory for summary.json.
     #[arg(long, default_value = "target/simbench")]
     out_dir: PathBuf,
+    /// Emit per-client breakdown details to stdout (visibility scenario only).
+    #[arg(long, default_value_t = false)]
+    debug_client_breakdown: bool,
+    /// Emit encode spike info (max encode time + size).
+    #[arg(long, default_value_t = false)]
+    debug_encode_spikes: bool,
+    /// Emit per-tick encode timing on burst ticks.
+    #[arg(long, default_value_t = false)]
+    debug_burst_ticks: bool,
     /// Fail if p95 delta packet size exceeds this value.
     #[arg(long)]
     max_p95_delta_bytes: Option<u64>,
@@ -103,7 +115,14 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let mut per_client_breakdown =
+        if cli.scenario == Scenario::Visibility && cli.debug_client_breakdown {
+            Some(ClientBreakdown::default())
+        } else {
+            None
+        };
     let mut client_baselines: Vec<codec::Snapshot> = Vec::new();
+    let mut client_last_ticks: Vec<codec::SnapshotTick> = Vec::new();
 
     for tick in 1..=cli.ticks {
         step_states(&mut states, &mut rng, tick, &cli);
@@ -116,6 +135,7 @@ fn main() -> Result<()> {
             full_bytes_total += full_bytes.len() as u64;
             full_count += 1;
         } else {
+            let burst_now = is_burst_tick(&cli, tick);
             let start = Instant::now();
             let delta_bytes = encode_delta_with_scratch(
                 &schema,
@@ -125,11 +145,23 @@ fn main() -> Result<()> {
                 &mut scratch,
             )?;
             let elapsed = start.elapsed();
-            sdec.add(delta_bytes.len() as u64, elapsed.as_micros() as u64);
+            let sdec_us = elapsed.as_micros() as u64;
+            sdec.add_with_tick(delta_bytes.len() as u64, sdec_us, tick);
             let naive_start = Instant::now();
             let naive_bytes = encode_naive_delta(&schema, &baseline_snapshot, &snapshot)?;
             let naive_elapsed = naive_start.elapsed();
-            naive.add(naive_bytes as u64, naive_elapsed.as_micros() as u64);
+            let naive_us = naive_elapsed.as_micros() as u64;
+            naive.add_with_tick(naive_bytes as u64, naive_us, tick);
+            if cli.debug_burst_ticks && burst_now {
+                println!(
+                    "burst tick {}: sdec_us={} sdec_bytes={} naive_us={} naive_bytes={}",
+                    tick,
+                    sdec_us,
+                    delta_bytes.len(),
+                    naive_us,
+                    naive_bytes
+                );
+            }
         }
 
         if cli.scenario == Scenario::Visibility {
@@ -140,19 +172,28 @@ fn main() -> Result<()> {
                         entities: Vec::new(),
                     })
                     .collect();
+                client_last_ticks = vec![codec::SnapshotTick::new(0); cli.clients as usize];
             }
             run_visibility(
                 &schema,
                 &states,
                 tick,
                 &mut client_baselines,
+                &mut client_last_ticks,
                 &mut scratch,
                 cli.visibility_radius_q,
                 per_client_stats.as_mut().expect("per-client stats"),
+                per_client_breakdown.as_mut(),
             )?;
         }
 
         baseline_snapshot = snapshot;
+    }
+
+    if cli.debug_encode_spikes {
+        println!("encode spikes:");
+        sdec.print_max("sdec");
+        naive.print_max("naive");
     }
 
     let summary = Summary::new(
@@ -167,6 +208,9 @@ fn main() -> Result<()> {
 
     summary.assert_budgets(cli.max_p95_delta_bytes, cli.max_avg_delta_bytes)?;
     write_summary_json(&cli.out_dir, &summary)?;
+    if let Some(breakdown) = per_client_breakdown {
+        breakdown.print();
+    }
 
     if summary.sdec.delta_p95 > wire_limits.max_packet_bytes as u64 {
         anyhow::bail!(
@@ -219,6 +263,128 @@ fn encode_delta_with_scratch(
     .context("encode delta snapshot")?;
     buf.truncate(bytes);
     Ok(buf)
+}
+
+fn encode_delta_for_client_with_scratch(
+    schema: &schema::Schema,
+    baseline: &codec::Snapshot,
+    current: &codec::Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+    last_tick: &mut codec::SnapshotTick,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; limits.max_section_bytes.max(wire::HEADER_SIZE) * 4];
+    let bytes = encode_delta_snapshot_for_client_session_with_scratch(
+        schema,
+        current.tick,
+        baseline.tick,
+        baseline,
+        current,
+        limits,
+        scratch,
+        last_tick,
+        &mut buf,
+    )
+    .context("encode delta snapshot (client session)")?;
+    buf.truncate(bytes);
+    Ok(buf)
+}
+
+#[derive(Default, Debug)]
+struct ClientBreakdown {
+    packets: u64,
+    packet_bytes: u64,
+    destroy_bytes: u64,
+    create_bytes: u64,
+    update_masked_bytes: u64,
+    update_sparse_bytes: u64,
+    update_entities: u64,
+    update_components: u64,
+    update_fields: u64,
+}
+
+impl ClientBreakdown {
+    fn print(&self) {
+        println!("client breakdown (visibility):");
+        println!("  packets: {}", self.packets);
+        println!(
+            "  section bytes: destroy={} create={} update_masked={} update_sparse={}",
+            self.destroy_bytes,
+            self.create_bytes,
+            self.update_masked_bytes,
+            self.update_sparse_bytes
+        );
+        if self.packets > 0 {
+            let avg_packet = self.packet_bytes as f64 / self.packets as f64;
+            let avg_update_bytes =
+                (self.update_masked_bytes + self.update_sparse_bytes) as f64 / self.packets as f64;
+            println!("  avg packet bytes: {:.1}", avg_packet);
+            println!("  avg update section bytes: {:.1}", avg_update_bytes);
+            println!("  avg overhead bytes: {:.1}", avg_packet - avg_update_bytes);
+        }
+        println!(
+            "  updates: entities={} components={} fields={}",
+            self.update_entities, self.update_components, self.update_fields
+        );
+    }
+}
+
+fn record_client_breakdown_session(
+    breakdown: &mut ClientBreakdown,
+    schema: &schema::Schema,
+    bytes: &[u8],
+    last_tick: u32,
+) -> Result<()> {
+    let header = wire::decode_session_header(bytes, last_tick).context("decode session header")?;
+    let payload_start = header.header_len;
+    let payload_end = payload_start + header.payload_len as usize;
+    if payload_end > bytes.len() {
+        anyhow::bail!("session payload length exceeds buffer");
+    }
+    let payload = &bytes[payload_start..payload_end];
+    let sections =
+        wire::decode_sections(payload, &WireLimits::default()).context("decode sections")?;
+
+    breakdown.packets += 1;
+    breakdown.packet_bytes += bytes.len() as u64;
+    for section in &sections {
+        match section.tag {
+            wire::SectionTag::EntityDestroy => breakdown.destroy_bytes += section.body.len() as u64,
+            wire::SectionTag::EntityCreate => breakdown.create_bytes += section.body.len() as u64,
+            wire::SectionTag::EntityUpdate => {
+                breakdown.update_masked_bytes += section.body.len() as u64
+            }
+            wire::SectionTag::EntityUpdateSparse | wire::SectionTag::EntityUpdateSparsePacked => {
+                breakdown.update_sparse_bytes += section.body.len() as u64
+            }
+            _ => {}
+        }
+    }
+
+    if header.flags.is_delta_snapshot() {
+        let packet = wire::WirePacket {
+            header: wire::PacketHeader {
+                version: wire::VERSION,
+                flags: wire::PacketFlags::from_raw(header.flags.raw() as u16),
+                schema_hash: schema::schema_hash(schema),
+                tick: header.tick,
+                baseline_tick: header.baseline_tick,
+                payload_len: header.payload_len,
+            },
+            sections,
+        };
+        let decoded = codec::decode_delta_packet(schema, &packet, &CodecLimits::default())
+            .context("decode delta packet")?;
+        breakdown.update_entities += decoded.updates.len() as u64;
+        for entity in decoded.updates {
+            breakdown.update_components += entity.components.len() as u64;
+            for component in entity.components {
+                breakdown.update_fields += component.fields.len() as u64;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn encode_bincode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
@@ -638,14 +804,17 @@ fn step_burst(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_visibility(
     schema: &schema::Schema,
     states: &[DemoEntityState],
     tick: u32,
     baselines: &mut [codec::Snapshot],
+    last_ticks: &mut [codec::SnapshotTick],
     scratch: &mut CodecScratch,
     radius_q: i64,
     stats: &mut PerClientStats,
+    mut breakdown: Option<&mut ClientBreakdown>,
 ) -> Result<()> {
     let radius_sq = radius_q * radius_q;
     for (idx, baseline) in baselines.iter_mut().enumerate() {
@@ -664,13 +833,19 @@ fn run_visibility(
 
         if tick > 1 {
             let start = Instant::now();
-            let delta_bytes = encode_delta_with_scratch(
+            let last_tick = &mut last_ticks[idx];
+            let prev_last_tick = last_tick.raw();
+            let delta_bytes = encode_delta_for_client_with_scratch(
                 schema,
                 baseline,
                 &snapshot,
                 &CodecLimits::default(),
                 scratch,
+                last_tick,
             )?;
+            if let Some(breakdown) = breakdown.as_mut() {
+                record_client_breakdown_session(breakdown, schema, &delta_bytes, prev_last_tick)?;
+            }
             let elapsed = start.elapsed();
             stats
                 .sdec
@@ -692,21 +867,47 @@ fn clamp(value: i64, min: i64, max: i64) -> i64 {
     value.min(max).max(min)
 }
 
+fn is_burst_tick(cli: &Cli, tick: u32) -> bool {
+    cli.burst_every
+        .is_some_and(|every| every > 0 && tick % every == 0)
+}
+
 #[derive(Default)]
 struct EncoderStats {
     sizes: Vec<u64>,
     encode_us: Vec<u64>,
     total_bytes: u64,
     count: u32,
+    max_encode_us: u64,
+    max_encode_bytes: u64,
+    max_encode_tick: Option<u32>,
 }
 
 impl EncoderStats {
     fn add(&mut self, bytes: u64, encode_us: u64) {
+        self.add_with_tick(bytes, encode_us, 0);
+    }
+
+    fn add_with_tick(&mut self, bytes: u64, encode_us: u64, tick: u32) {
         self.total_bytes += bytes;
         self.count += 1;
         self.sizes.push(bytes);
         if encode_us > 0 {
             self.encode_us.push(encode_us);
+        }
+        if encode_us > self.max_encode_us {
+            self.max_encode_us = encode_us;
+            self.max_encode_bytes = bytes;
+            self.max_encode_tick = Some(tick);
+        }
+    }
+
+    fn print_max(&self, label: &str) {
+        if let Some(tick) = self.max_encode_tick {
+            println!(
+                "  {label}: max_encode_us={} bytes={} tick={}",
+                self.max_encode_us, self.max_encode_bytes, tick
+            );
         }
     }
 

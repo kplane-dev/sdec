@@ -183,7 +183,8 @@ pub fn inspect_packet(
             SectionTag::EntityDestroy
             | SectionTag::EntityCreate
             | SectionTag::EntityUpdate
-            | SectionTag::EntityUpdateSparse => {
+            | SectionTag::EntityUpdateSparse
+            | SectionTag::EntityUpdateSparsePacked => {
                 Some(read_section_count(section.body).context("read section count")?)
             }
             _ => None,
