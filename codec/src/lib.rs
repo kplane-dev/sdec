@@ -17,11 +17,13 @@
 //! - **No steady-state allocations** - Uses caller-provided buffers.
 //! - **Deterministic** - Same inputs produce same outputs.
 
+mod baseline;
 mod error;
 mod limits;
 mod snapshot;
 mod types;
 
+pub use baseline::{BaselineError, BaselineStore};
 pub use error::{CodecError, CodecResult, LimitKind, MaskKind, MaskReason, ValueReason};
 pub use limits::CodecLimits;
 pub use snapshot::{
