@@ -19,6 +19,9 @@ mod schema;
 
 use std::num::NonZeroU16;
 
+#[cfg(feature = "serde")]
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+
 pub use error::{SchemaError, SchemaResult};
 pub use field::{ChangePolicy, FieldCodec, FieldDef, FixedPoint};
 pub use hash::schema_hash;
@@ -45,6 +48,21 @@ impl ComponentId {
     }
 }
 
+#[cfg(feature = "serde")]
+impl Serialize for ComponentId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(self.get())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for ComponentId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u16::deserialize(deserializer)?;
+        ComponentId::new(value).ok_or_else(|| D::Error::custom("component id must be non-zero"))
+    }
+}
+
 /// A field ID within a component (non-zero).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FieldId(NonZeroU16);
@@ -63,6 +81,21 @@ impl FieldId {
     #[must_use]
     pub const fn get(self) -> u16 {
         self.0.get()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for FieldId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(self.get())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for FieldId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u16::deserialize(deserializer)?;
+        FieldId::new(value).ok_or_else(|| D::Error::custom("field id must be non-zero"))
     }
 }
 

@@ -2,7 +2,11 @@
 
 use crate::FieldId;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Fixed-point quantization parameters (all integer-based).
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedPoint {
     /// Minimum quantized value.
@@ -26,6 +30,7 @@ impl FixedPoint {
 }
 
 /// The encoding for a field (representation only).
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldCodec {
     /// Boolean (1 bit).
@@ -86,6 +91,7 @@ impl FieldCodec {
 }
 
 /// Change detection policy for a field.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangePolicy {
     /// Always send when present in the component mask.
@@ -95,6 +101,7 @@ pub enum ChangePolicy {
 }
 
 /// Field definition within a component.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldDef {
     pub id: FieldId,

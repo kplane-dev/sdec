@@ -198,47 +198,7 @@ pub fn apply_delta_snapshot_from_packet(
         });
     }
 
-    let mut destroys: Option<Vec<EntityId>> = None;
-    let mut creates: Option<Vec<EntitySnapshot>> = None;
-    let mut updates: Option<Vec<UpdateEntity>> = None;
-
-    for section in &packet.sections {
-        match section.tag {
-            SectionTag::EntityDestroy => {
-                if destroys.is_some() {
-                    return Err(CodecError::DuplicateSection {
-                        section: section.tag,
-                    });
-                }
-                destroys = Some(decode_destroy_section(section.body, limits)?);
-            }
-            SectionTag::EntityCreate => {
-                if creates.is_some() {
-                    return Err(CodecError::DuplicateSection {
-                        section: section.tag,
-                    });
-                }
-                creates = Some(decode_create_section(schema, section.body, limits)?);
-            }
-            SectionTag::EntityUpdate => {
-                if updates.is_some() {
-                    return Err(CodecError::DuplicateSection {
-                        section: section.tag,
-                    });
-                }
-                updates = Some(decode_update_section(schema, section.body, limits)?);
-            }
-            _ => {
-                return Err(CodecError::UnexpectedSection {
-                    section: section.tag,
-                });
-            }
-        }
-    }
-
-    let destroys = destroys.unwrap_or_default();
-    let creates = creates.unwrap_or_default();
-    let updates = updates.unwrap_or_default();
+    let (destroys, creates, updates) = decode_delta_sections(schema, packet, limits)?;
 
     ensure_entities_sorted(&baseline.entities)?;
     ensure_entities_sorted(&creates)?;
@@ -257,6 +217,51 @@ pub fn apply_delta_snapshot_from_packet(
     Ok(Snapshot {
         tick: SnapshotTick::new(header.tick),
         entities: remaining,
+    })
+}
+
+/// Decodes a delta packet without applying it to a baseline.
+pub fn decode_delta_packet(
+    schema: &schema::Schema,
+    packet: &WirePacket<'_>,
+    limits: &CodecLimits,
+) -> CodecResult<DeltaDecoded> {
+    let header = packet.header;
+    if !header.flags.is_delta_snapshot() {
+        return Err(CodecError::Wire(wire::DecodeError::InvalidFlags {
+            flags: header.flags.raw(),
+        }));
+    }
+    let expected_hash = schema_hash(schema);
+    if header.schema_hash != expected_hash {
+        return Err(CodecError::SchemaMismatch {
+            expected: expected_hash,
+            found: header.schema_hash,
+        });
+    }
+
+    let (destroys, creates, updates) = decode_delta_sections(schema, packet, limits)?;
+    let updates = updates
+        .into_iter()
+        .map(|update| DeltaUpdateEntity {
+            id: update.id,
+            components: update
+                .components
+                .into_iter()
+                .map(|component| DeltaUpdateComponent {
+                    id: component.id,
+                    fields: component.fields,
+                })
+                .collect(),
+        })
+        .collect();
+
+    Ok(DeltaDecoded {
+        tick: SnapshotTick::new(header.tick),
+        baseline_tick: SnapshotTick::new(header.baseline_tick),
+        destroys,
+        creates,
+        updates,
     })
 }
 
@@ -683,6 +688,77 @@ struct UpdateEntity {
 struct UpdateComponent {
     id: ComponentId,
     fields: Vec<(usize, FieldValue)>,
+}
+
+fn decode_delta_sections(
+    schema: &schema::Schema,
+    packet: &WirePacket<'_>,
+    limits: &CodecLimits,
+) -> CodecResult<(Vec<EntityId>, Vec<EntitySnapshot>, Vec<UpdateEntity>)> {
+    let mut destroys: Option<Vec<EntityId>> = None;
+    let mut creates: Option<Vec<EntitySnapshot>> = None;
+    let mut updates: Option<Vec<UpdateEntity>> = None;
+
+    for section in &packet.sections {
+        match section.tag {
+            SectionTag::EntityDestroy => {
+                if destroys.is_some() {
+                    return Err(CodecError::DuplicateSection {
+                        section: section.tag,
+                    });
+                }
+                destroys = Some(decode_destroy_section(section.body, limits)?);
+            }
+            SectionTag::EntityCreate => {
+                if creates.is_some() {
+                    return Err(CodecError::DuplicateSection {
+                        section: section.tag,
+                    });
+                }
+                creates = Some(decode_create_section(schema, section.body, limits)?);
+            }
+            SectionTag::EntityUpdate => {
+                if updates.is_some() {
+                    return Err(CodecError::DuplicateSection {
+                        section: section.tag,
+                    });
+                }
+                updates = Some(decode_update_section(schema, section.body, limits)?);
+            }
+            _ => {
+                return Err(CodecError::UnexpectedSection {
+                    section: section.tag,
+                });
+            }
+        }
+    }
+
+    Ok((
+        destroys.unwrap_or_default(),
+        creates.unwrap_or_default(),
+        updates.unwrap_or_default(),
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaDecoded {
+    pub tick: SnapshotTick,
+    pub baseline_tick: SnapshotTick,
+    pub destroys: Vec<EntityId>,
+    pub creates: Vec<EntitySnapshot>,
+    pub updates: Vec<DeltaUpdateEntity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaUpdateEntity {
+    pub id: EntityId,
+    pub components: Vec<DeltaUpdateComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeltaUpdateComponent {
+    pub id: ComponentId,
+    pub fields: Vec<(usize, FieldValue)>,
 }
 
 fn apply_destroys(

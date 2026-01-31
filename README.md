@@ -34,26 +34,64 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](W
 ## Quick Start
 
 ```rust
-// Example usage (coming in the initial release)
-use codec::{Encoder, Decoder, Schema};
+use codec::{
+    apply_delta_snapshot, encode_delta_snapshot, encode_full_snapshot, CodecLimits, Snapshot,
+    SnapshotTick,
+};
+use schema::{ComponentDef, FieldCodec, FieldDef, FieldId, Schema};
 
-// Define your schema
-let schema = Schema::builder()
-    .component("Transform")
-        .field("x", FieldCodec::fixed_point(-1000.0, 1000.0, 16))
-        .field("y", FieldCodec::fixed_point(-1000.0, 1000.0, 16))
-        .field("z", FieldCodec::fixed_point(-1000.0, 1000.0, 16))
-    .build();
+let component = ComponentDef::new(schema::ComponentId::new(1).unwrap())
+    .field(FieldDef::new(FieldId::new(1).unwrap(), FieldCodec::bool()));
+let schema = Schema::new(vec![component]).unwrap();
 
-// Encode a snapshot
-let mut encoder = Encoder::new(&schema);
-// ... add entities ...
-let packet = encoder.encode_full_snapshot(tick);
+let baseline = Snapshot {
+    tick: SnapshotTick::new(10),
+    entities: vec![],
+};
 
-// Decode on the client
-let mut decoder = Decoder::new(&schema);
-let snapshot = decoder.decode(&packet)?;
+let mut buf = [0u8; 256];
+let _full_len = encode_full_snapshot(
+    &schema,
+    baseline.tick,
+    &baseline.entities,
+    &CodecLimits::for_testing(),
+    &mut buf,
+)
+.unwrap();
+
+let delta_len = encode_delta_snapshot(
+    &schema,
+    SnapshotTick::new(11),
+    baseline.tick,
+    &baseline,
+    &baseline,
+    &CodecLimits::for_testing(),
+    &mut buf,
+)
+.unwrap();
+
+let applied = apply_delta_snapshot(
+    &schema,
+    &baseline,
+    &buf[..delta_len],
+    &wire::Limits::for_testing(),
+    &CodecLimits::for_testing(),
+)
+.unwrap();
 ```
+
+## Tools
+
+The `sdec-tools` CLI provides packet inspection and decoding:
+
+```bash
+cargo run -p tools -- inspect packet.bin --schema schema.json
+cargo run -p tools -- inspect captures/ --schema schema.json --glob "delta_*.bin" --sort size --limit 10
+cargo run -p tools -- decode packet.bin --schema schema.json
+cargo run -p tools -- decode packet.bin --schema schema.json --format pretty
+```
+
+Schema JSON is available via the optional `serde` feature on the `schema` crate.
 
 ## Building
 

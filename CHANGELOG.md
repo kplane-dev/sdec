@@ -31,3 +31,13 @@ This project follows Semantic Versioning for pre-1.0 releases.
 - Delta encoding now streams entity ops without temporary allocations.
 - Update component diffing uses bounded scratch masks and limit checks before growth.
 
+## [0.4.0] - 2026-01-31
+
+### Added
+- `sdec-tools` CLI with `inspect` and `decode` commands and JSON decode output.
+- Schema JSON support via optional serde feature.
+- Delta packet decode helper for tools (`decode_delta_packet`).
+
+### Changed
+- Tools crate now includes structured inspect/decode report builders and tests.
+
