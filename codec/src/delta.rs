@@ -103,6 +103,7 @@ pub fn encode_delta_snapshot_for_client(
 }
 
 /// Encodes a delta snapshot for a client-specific view using reusable scratch buffers.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_delta_snapshot_for_client_with_scratch(
     schema: &schema::Schema,
     tick: SnapshotTick,

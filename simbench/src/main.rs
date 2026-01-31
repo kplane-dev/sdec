@@ -753,6 +753,7 @@ fn step_burst(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_visibility(
     schema: &schema::Schema,
     states: &[DemoEntityState],
