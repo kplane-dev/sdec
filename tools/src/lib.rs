@@ -180,7 +180,10 @@ pub fn inspect_packet(
 
     for section in &packet.sections {
         let entity_count = match section.tag {
-            SectionTag::EntityDestroy | SectionTag::EntityCreate | SectionTag::EntityUpdate => {
+            SectionTag::EntityDestroy
+            | SectionTag::EntityCreate
+            | SectionTag::EntityUpdate
+            | SectionTag::EntityUpdateSparse => {
                 Some(read_section_count(section.body).context("read section count")?)
             }
             _ => None,
@@ -393,7 +396,7 @@ fn field_value_output(index: usize, value: FieldValue) -> FieldValueOutput {
 mod tests {
     use super::*;
     use codec::{encode_delta_snapshot, encode_full_snapshot, ComponentSnapshot, EntitySnapshot};
-    use schema::{ComponentDef, FieldCodec, FieldDef, FieldId, Schema};
+    use schema::{schema_hash, ComponentDef, FieldCodec, FieldDef, FieldId, Schema};
 
     fn schema_one_bool() -> Schema {
         let component = ComponentDef::new(schema::ComponentId::new(1).unwrap())
@@ -479,5 +482,42 @@ mod tests {
         assert!(output.full_snapshot.is_some());
         let pretty = format_decode_pretty(&output);
         assert!(pretty.contains("kind: full_snapshot"));
+    }
+
+    #[test]
+    fn decode_rejects_both_update_encodings() {
+        let schema = schema_one_bool();
+        let update_body = [0u8; 1];
+        let mut update_section = [0u8; 8];
+        let update_len =
+            wire::encode_section(SectionTag::EntityUpdate, &update_body, &mut update_section)
+                .unwrap();
+
+        let mut sparse_section = [0u8; 8];
+        let sparse_len = wire::encode_section(
+            SectionTag::EntityUpdateSparse,
+            &update_body,
+            &mut sparse_section,
+        )
+        .unwrap();
+
+        let payload_len = (update_len + sparse_len) as u32;
+        let header = wire::PacketHeader::delta_snapshot(schema_hash(&schema), 2, 1, payload_len);
+        let mut buf = vec![0u8; wire::HEADER_SIZE + payload_len as usize];
+        wire::encode_header(&header, &mut buf[..wire::HEADER_SIZE]).unwrap();
+        buf[wire::HEADER_SIZE..wire::HEADER_SIZE + update_len]
+            .copy_from_slice(&update_section[..update_len]);
+        buf[wire::HEADER_SIZE + update_len..wire::HEADER_SIZE + update_len + sparse_len]
+            .copy_from_slice(&sparse_section[..sparse_len]);
+
+        let err = decode_packet_json(
+            &buf,
+            &schema,
+            &wire::Limits::for_testing(),
+            &CodecLimits::for_testing(),
+        )
+        .unwrap_err();
+        let root = err.root_cause().to_string();
+        assert!(root.contains("update encodings"));
     }
 }

@@ -6,7 +6,7 @@
 pub const MAGIC: u32 = 0x5344_4543; // "SDEC" in ASCII
 
 /// Current wire format version.
-pub const VERSION: u16 = 0;
+pub const VERSION: u16 = 1;
 
 /// Header size in bytes (28 total).
 pub const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 4 + 4 + 4;
@@ -145,8 +145,8 @@ mod tests {
     }
 
     #[test]
-    fn version_is_zero() {
-        assert_eq!(VERSION, 0);
+    fn version_is_one() {
+        assert_eq!(VERSION, 1);
     }
 
     #[test]
