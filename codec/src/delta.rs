@@ -196,12 +196,6 @@ pub fn apply_delta_snapshot_from_packet(
         });
     }
 
-    if header.baseline_tick == 0 {
-        return Err(CodecError::Wire(wire::DecodeError::InvalidBaselineTick {
-            baseline_tick: header.baseline_tick,
-            flags: header.flags.raw(),
-        }));
-    }
     let expected_hash = schema_hash(schema);
     if header.schema_hash != expected_hash {
         return Err(CodecError::SchemaMismatch {
@@ -241,6 +235,12 @@ pub fn decode_delta_packet(
     let header = packet.header;
     if !header.flags.is_delta_snapshot() {
         return Err(CodecError::Wire(wire::DecodeError::InvalidFlags {
+            flags: header.flags.raw(),
+        }));
+    }
+    if header.baseline_tick == 0 {
+        return Err(CodecError::Wire(wire::DecodeError::InvalidBaselineTick {
+            baseline_tick: header.baseline_tick,
             flags: header.flags.raw(),
         }));
     }
@@ -1032,14 +1032,6 @@ fn write_update_components(
             scratch.component_and_field_masks_mut(component_count, component.fields.len());
         if component_changed[idx] {
             let field_mask = compute_field_mask_into(component, base, curr, field_mask)?;
-            if component.fields.len() > limits.max_fields_per_component {
-                return Err(CodecError::LimitsExceeded {
-                    kind: LimitKind::FieldsPerComponent,
-                    limit: limits.max_fields_per_component,
-                    actual: component.fields.len(),
-                });
-            }
-
             for bit in field_mask {
                 writer.write_bit(*bit)?;
             }
