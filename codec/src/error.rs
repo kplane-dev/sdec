@@ -54,6 +54,9 @@ pub enum CodecError {
     /// Duplicate section encountered.
     DuplicateSection { section: wire::SectionTag },
 
+    /// Baseline tick does not match the packet.
+    BaselineTickMismatch { expected: u32, found: u32 },
+
     /// Baseline tick not found in history.
     BaselineNotFound {
         /// The requested baseline tick.
@@ -91,6 +94,9 @@ pub enum CodecError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitKind {
     EntitiesCreate,
+    EntitiesUpdate,
+    EntitiesDestroy,
+    TotalEntitiesAfterApply,
     ComponentsPerEntity,
     FieldsPerComponent,
     SectionBytes,
@@ -110,6 +116,8 @@ pub enum MaskReason {
     FieldCountMismatch { expected: usize, actual: usize },
     MissingField { field: FieldId },
     UnknownComponent { component: ComponentId },
+    ComponentPresenceMismatch { component: ComponentId },
+    EmptyFieldMask { component: ComponentId },
 }
 
 /// Details for invalid value errors.
@@ -189,6 +197,12 @@ impl fmt::Display for CodecError {
             Self::DuplicateSection { section } => {
                 write!(f, "duplicate section {section:?} in packet")
             }
+            Self::BaselineTickMismatch { expected, found } => {
+                write!(
+                    f,
+                    "baseline tick mismatch: expected {expected}, found {found}"
+                )
+            }
             Self::BaselineNotFound { requested_tick } => {
                 write!(f, "baseline tick {requested_tick} not found in history")
             }
@@ -218,6 +232,9 @@ impl fmt::Display for LimitKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::EntitiesCreate => "entities",
+            Self::EntitiesUpdate => "update entities",
+            Self::EntitiesDestroy => "destroy entities",
+            Self::TotalEntitiesAfterApply => "total entities",
             Self::ComponentsPerEntity => "components per entity",
             Self::FieldsPerComponent => "fields per component",
             Self::SectionBytes => "section bytes",
@@ -252,6 +269,12 @@ impl fmt::Display for MaskReason {
             }
             Self::UnknownComponent { component } => {
                 write!(f, "unknown component {component:?} in snapshot")
+            }
+            Self::ComponentPresenceMismatch { component } => {
+                write!(f, "component presence mismatch for {component:?}")
+            }
+            Self::EmptyFieldMask { component } => {
+                write!(f, "empty field mask for {component:?} is invalid")
             }
         }
     }
