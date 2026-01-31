@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn error_from_bit_error() {
-        let bit_err = bitstream::BitError::EndOfBuffer {
+        let bit_err = bitstream::BitError::UnexpectedEof {
             requested: 8,
             available: 0,
         };
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn error_source_bit_error() {
-        let bit_err = bitstream::BitError::EndOfBuffer {
+        let bit_err = bitstream::BitError::UnexpectedEof {
             requested: 8,
             available: 0,
         };

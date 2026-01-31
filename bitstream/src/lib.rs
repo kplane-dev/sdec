@@ -1,6 +1,7 @@
 //! Low-level bit packing primitives for the sdec codec.
 //!
-//! This crate provides [`BitWriter`] and [`BitReader`] for bit-level encoding and decoding.
+//! This crate provides bounded [`BitWriter`] and [`BitReader`] for bit-level encoding and decoding.
+//! For convenience, [`BitVecWriter`] can be used when a growable buffer is acceptable.
 //! It is designed for bounded, panic-free operation with explicit error handling.
 //!
 //! # Design Principles
@@ -13,16 +14,16 @@
 //! # Example
 //!
 //! ```
-//! use bitstream::{BitWriter, BitReader};
+//! use bitstream::{BitReader, BitVecWriter};
 //!
-//! let mut writer = BitWriter::new();
-//! writer.write_bool(true);
+//! let mut writer = BitVecWriter::new();
+//! writer.write_bit(true);
 //! writer.write_bits(42, 7).unwrap();
 //!
 //! let bytes = writer.finish();
 //!
 //! let mut reader = BitReader::new(&bytes);
-//! assert_eq!(reader.read_bool().unwrap(), true);
+//! assert!(reader.read_bit().unwrap());
 //! assert_eq!(reader.read_bits(7).unwrap(), 42);
 //! ```
 
@@ -32,7 +33,7 @@ mod writer;
 
 pub use error::{BitError, BitResult};
 pub use reader::BitReader;
-pub use writer::BitWriter;
+pub use writer::{BitVecWriter, BitWriter};
 
 #[cfg(test)]
 mod tests {
@@ -40,7 +41,7 @@ mod tests {
 
     #[test]
     fn empty_roundtrip() {
-        let writer = BitWriter::new();
+        let writer = BitVecWriter::new();
         let bytes = writer.finish();
         assert!(bytes.is_empty());
 
@@ -49,45 +50,45 @@ mod tests {
     }
 
     #[test]
-    fn single_bool_roundtrip() {
-        let mut writer = BitWriter::new();
-        writer.write_bool(true);
+    fn single_bit_roundtrip() {
+        let mut writer = BitVecWriter::new();
+        writer.write_bit(true);
         let bytes = writer.finish();
 
         let mut reader = BitReader::new(&bytes);
-        assert!(reader.read_bool().unwrap());
+        assert!(reader.read_bit().unwrap());
     }
 
     #[test]
-    fn multiple_bools_roundtrip() {
-        let mut writer = BitWriter::new();
-        writer.write_bool(true);
-        writer.write_bool(false);
-        writer.write_bool(true);
-        writer.write_bool(true);
-        writer.write_bool(false);
+    fn multiple_bits_roundtrip() {
+        let mut writer = BitVecWriter::new();
+        writer.write_bit(true);
+        writer.write_bit(false);
+        writer.write_bit(true);
+        writer.write_bit(true);
+        writer.write_bit(false);
         let bytes = writer.finish();
 
         let mut reader = BitReader::new(&bytes);
-        assert!(reader.read_bool().unwrap());
-        assert!(!reader.read_bool().unwrap());
-        assert!(reader.read_bool().unwrap());
-        assert!(reader.read_bool().unwrap());
-        assert!(!reader.read_bool().unwrap());
+        assert!(reader.read_bit().unwrap());
+        assert!(!reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
+        assert!(reader.read_bit().unwrap());
+        assert!(!reader.read_bit().unwrap());
     }
 
     #[test]
     fn bits_roundtrip_various_sizes() {
         let test_cases = [
-            (0b1010u64, 4),
-            (0xFFu64, 8),
-            (0xABCDu64, 16),
-            (0x1234_5678u64, 32),
-            (u64::MAX, 64),
+            (0b1010u64, 4u8),
+            (0xFFu64, 8u8),
+            (0xABCDu64, 16u8),
+            (0x1234_5678u64, 32u8),
+            (u64::MAX, 64u8),
         ];
 
         for (value, bits) in test_cases {
-            let mut writer = BitWriter::new();
+            let mut writer = BitVecWriter::new();
             writer.write_bits(value, bits).unwrap();
             let bytes = writer.finish();
 
@@ -102,32 +103,32 @@ mod tests {
 
     #[test]
     fn mixed_roundtrip() {
-        let mut writer = BitWriter::new();
-        writer.write_bool(true);
+        let mut writer = BitVecWriter::new();
+        writer.write_bit(true);
         writer.write_bits(0b1010, 4).unwrap();
-        writer.write_bool(false);
+        writer.write_bit(false);
         writer.write_bits(0xFF, 8).unwrap();
         writer.write_bits(42, 7).unwrap();
         let bytes = writer.finish();
 
         let mut reader = BitReader::new(&bytes);
-        assert!(reader.read_bool().unwrap());
+        assert!(reader.read_bit().unwrap());
         assert_eq!(reader.read_bits(4).unwrap(), 0b1010);
-        assert!(!reader.read_bool().unwrap());
+        assert!(!reader.read_bit().unwrap());
         assert_eq!(reader.read_bits(8).unwrap(), 0xFF);
         assert_eq!(reader.read_bits(7).unwrap(), 42);
     }
 
     #[test]
     fn doctest_example() {
-        let mut writer = BitWriter::new();
-        writer.write_bool(true);
+        let mut writer = BitVecWriter::new();
+        writer.write_bit(true);
         writer.write_bits(42, 7).unwrap();
 
         let bytes = writer.finish();
 
         let mut reader = BitReader::new(&bytes);
-        assert!(reader.read_bool().unwrap());
+        assert!(reader.read_bit().unwrap());
         assert_eq!(reader.read_bits(7).unwrap(), 42);
     }
 }
