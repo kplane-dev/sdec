@@ -41,6 +41,11 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.6.0] - 2026-01-31
+
+### Changed
+- Bump workspace and internal crate versions to 0.6.0.
+
 ## [0.5.0] - 2026-01-31
 
 ### Added
