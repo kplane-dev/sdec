@@ -126,8 +126,10 @@ fn main() -> Result<()> {
             )?;
             let elapsed = start.elapsed();
             sdec.add(delta_bytes.len() as u64, elapsed.as_micros() as u64);
+            let naive_start = Instant::now();
             let naive_bytes = encode_naive_delta(&schema, &baseline_snapshot, &snapshot)?;
-            naive.add(naive_bytes as u64, 0);
+            let naive_elapsed = naive_start.elapsed();
+            naive.add(naive_bytes as u64, naive_elapsed.as_micros() as u64);
         }
 
         if cli.scenario == Scenario::Visibility {
@@ -673,8 +675,12 @@ fn run_visibility(
             stats
                 .sdec
                 .add(delta_bytes.len() as u64, elapsed.as_micros() as u64);
+            let naive_start = Instant::now();
             let naive_bytes = encode_naive_delta(schema, baseline, &snapshot)?;
-            stats.naive.add(naive_bytes as u64, 0);
+            let naive_elapsed = naive_start.elapsed();
+            stats
+                .naive
+                .add(naive_bytes as u64, naive_elapsed.as_micros() as u64);
         }
 
         *baseline = snapshot;
