@@ -5,7 +5,10 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use bitstream::BitVecWriter;
 use clap::{Parser, ValueEnum};
-use codec::{encode_delta_snapshot_with_scratch, encode_full_snapshot, CodecLimits, CodecScratch};
+use codec::{
+    encode_delta_snapshot_for_client_with_scratch, encode_delta_snapshot_with_scratch,
+    encode_full_snapshot, CodecLimits, CodecScratch,
+};
 use serde::Serialize;
 use wire::Limits as WireLimits;
 
@@ -217,6 +220,29 @@ fn encode_delta_with_scratch(
         &mut buf,
     )
     .context("encode delta snapshot")?;
+    buf.truncate(bytes);
+    Ok(buf)
+}
+
+fn encode_delta_for_client_with_scratch(
+    schema: &schema::Schema,
+    baseline: &codec::Snapshot,
+    current: &codec::Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; limits.max_section_bytes.max(wire::HEADER_SIZE) * 4];
+    let bytes = encode_delta_snapshot_for_client_with_scratch(
+        schema,
+        current.tick,
+        baseline.tick,
+        baseline,
+        current,
+        limits,
+        scratch,
+        &mut buf,
+    )
+    .context("encode delta snapshot (client)")?;
     buf.truncate(bytes);
     Ok(buf)
 }
@@ -664,7 +690,7 @@ fn run_visibility(
 
         if tick > 1 {
             let start = Instant::now();
-            let delta_bytes = encode_delta_with_scratch(
+            let delta_bytes = encode_delta_for_client_with_scratch(
                 schema,
                 baseline,
                 &snapshot,

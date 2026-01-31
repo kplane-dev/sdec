@@ -62,6 +62,87 @@ pub fn encode_delta_snapshot_with_scratch(
     scratch: &mut CodecScratch,
     out: &mut [u8],
 ) -> CodecResult<usize> {
+    encode_delta_snapshot_with_scratch_mode(
+        schema,
+        tick,
+        baseline_tick,
+        baseline,
+        current,
+        limits,
+        scratch,
+        out,
+        EncodeUpdateMode::Auto,
+    )
+}
+
+/// Encodes a delta snapshot for a client-specific view.
+///
+/// This assumes `baseline` and `current` are already filtered for the client interest set.
+/// Updates are encoded in sparse mode to optimize for small per-client packets.
+pub fn encode_delta_snapshot_for_client(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    let mut scratch = CodecScratch::default();
+    encode_delta_snapshot_for_client_with_scratch(
+        schema,
+        tick,
+        baseline_tick,
+        baseline,
+        current,
+        limits,
+        &mut scratch,
+        out,
+    )
+}
+
+/// Encodes a delta snapshot for a client-specific view using reusable scratch buffers.
+pub fn encode_delta_snapshot_for_client_with_scratch(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    encode_delta_snapshot_with_scratch_mode(
+        schema,
+        tick,
+        baseline_tick,
+        baseline,
+        current,
+        limits,
+        scratch,
+        out,
+        EncodeUpdateMode::Sparse,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncodeUpdateMode {
+    Auto,
+    Sparse,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_delta_snapshot_with_scratch_mode(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+    out: &mut [u8],
+    mode: EncodeUpdateMode,
+) -> CodecResult<usize> {
     if out.len() < wire::HEADER_SIZE {
         return Err(CodecError::OutputTooSmall {
             needed: wire::HEADER_SIZE,
@@ -124,7 +205,12 @@ pub fn encode_delta_snapshot_with_scratch(
         offset += written;
     }
     if counts.updates > 0 {
-        let update_encoding = select_update_encoding(schema, baseline, current, limits, scratch)?;
+        let update_encoding = match mode {
+            EncodeUpdateMode::Auto => {
+                select_update_encoding(schema, baseline, current, limits, scratch)?
+            }
+            EncodeUpdateMode::Sparse => UpdateEncoding::Sparse,
+        };
         let section_tag = match update_encoding {
             UpdateEncoding::Masked => SectionTag::EntityUpdate,
             UpdateEncoding::Sparse => SectionTag::EntityUpdateSparse,
