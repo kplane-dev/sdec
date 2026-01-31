@@ -36,14 +36,14 @@ Packets are self-contained: they include enough metadata to validate schema comp
 
 ---
 
-## Header (version 1)
+## Header (version 2)
 
 The header is minimal and only includes fields we know we need now.
 
 | Field          | Type  | Required | Description |
 |----------------|-------|----------|-------------|
 | `magic`        | u32   | yes      | Fixed constant to identify this protocol. |
-| `version`      | u16   | yes      | Wire version. Version 1 uses `1`. |
+| `version`      | u16   | yes      | Wire version. Version 2 uses `2`. |
 | `flags`        | u16   | yes      | Packet kind flags (see below). |
 | `schema_hash`  | u64   | yes      | Reject packet if mismatched. |
 | `tick`         | u32   | yes      | Snapshot tick. |
@@ -52,22 +52,22 @@ The header is minimal and only includes fields we know we need now.
 
 ### Header constants
 - `magic`: chosen constant (set once; never change in versioned releases).
-- `version`: starts at `1`.
+- `version`: starts at `2`.
 
-### Flags (version 1)
+### Flags (version 2)
 Flags are a bitset:
 
 - `FULL_SNAPSHOT` (bit 0): payload contains a full snapshot.
 - `DELTA_SNAPSHOT` (bit 1): payload contains a delta snapshot.
 
-Exactly one of `FULL_SNAPSHOT` or `DELTA_SNAPSHOT` MUST be set in version 1.
+Exactly one of `FULL_SNAPSHOT` or `DELTA_SNAPSHOT` MUST be set in version 2.
 
 Reserved bits:
-- bits 2..15 reserved for future use; MUST be zero in version 1.
+- bits 2..15 reserved for future use; MUST be zero in version 2.
 
 ### Payload length validation
 `payload_len` MUST match the number of bytes following the header. Packets with
-extra or missing payload bytes are invalid in version 1.
+extra or missing payload bytes are invalid in version 2.
 
 ---
 
@@ -84,7 +84,7 @@ Rationale:
 - Section bodies may contain bit-packed structures internally.
 - `section_len` is a varuint capped at u32 (max 5 bytes). Overflow is invalid.
 
-### Section tags (version 1)
+### Section tags (version 2)
 Only the essential sections are defined.
 
 | Tag | Name              | Present in FULL | Present in DELTA | Purpose |
@@ -92,13 +92,14 @@ Only the essential sections are defined.
 | 1   | `ENTITY_CREATE`   | optional        | optional         | Spawn new entities with initial component state. |
 | 2   | `ENTITY_DESTROY`  | optional        | optional         | Despawn entities. |
 | 3   | `ENTITY_UPDATE`   | optional        | optional         | Update existing entities (masked updates). |
-| 4   | `ENTITY_UPDATE_SPARSE` | optional   | optional         | Update existing entities (sparse field list). |
+| 4   | `ENTITY_UPDATE_SPARSE` | optional   | optional         | Update existing entities (sparse field list, varint indices). |
+| 5   | `ENTITY_UPDATE_SPARSE_PACKED` | optional | optional | Update existing entities (sparse field list, bit-packed indices). |
 
 Notes:
 - FULL snapshot can be represented as a set of creates + updates; however in the initial version we keep semantics simple:
   - FULL packets SHOULD include all entities either as creates or updates.
 - DELTA packets include only changes since baseline (creates/destroys/updates).
-- Version 1 packets MUST NOT include both `ENTITY_UPDATE` and `ENTITY_UPDATE_SPARSE` sections.
+- Version 2 packets MUST NOT include more than one update section (`ENTITY_UPDATE`, `ENTITY_UPDATE_SPARSE`, or `ENTITY_UPDATE_SPARSE_PACKED`).
 
 Unknown section tags:
 - In the initial version: decoder MAY reject unknown tags.
@@ -108,10 +109,10 @@ Unknown section tags:
 
 ## Shared Types
 
-### EntityId (version 1)
+### EntityId (version 2)
 - `EntityId`: u32
 
-### ComponentId (version 1)
+### ComponentId (version 2)
 - `ComponentId`: u16 (small integer id from schema)
 
 ### Field encoding
@@ -141,7 +142,7 @@ Body:
 
 Notes:
 - For creates, `field_mask` SHOULD typically include all fields needed to initialize the entity.
-- `type_id` is only included if the schema supports multiple entity types; if not needed initially, omit `type_id` entirely in v1 and treat all entities as a single type.
+- `type_id` is only included if the schema supports multiple entity types; if not needed initially, omit `type_id` entirely in v2 and treat all entities as a single type.
 
 **Flexibility rule:** only include `type_id` if you truly need multi-type entities in the initial version.
 If you don’t, drop it from the initial version to keep the format minimal.
@@ -197,6 +198,26 @@ Notes:
 
 ---
 
+## `ENTITY_UPDATE_SPARSE_PACKED` section (tag = 5)
+
+Body:
+- `count` (varuint)
+- repeated `count` times:
+  - `entity_id` (varuint)
+  - `component_id` (varuint)
+  - `field_count` (varuint)
+  - repeated `field_count` times:
+    - `field_index_bits` (bit-packed, width = ceil(log2(num_fields)))
+    - encoded field value (bit-packed where possible)
+
+Notes:
+- `field_index_bits` are written without byte alignment.
+- Varint field values still align to byte boundaries before encoding.
+- `field_index_bits` MUST be strictly increasing.
+- `field_count` MUST be <= `max_fields_per_component`.
+
+---
+
 ## Delta Semantics
 
 For packets with `DELTA_SNAPSHOT` set:
@@ -235,10 +256,10 @@ If any limit is exceeded:
 
 ### Versioning
 - `version` is the wire compatibility knob.
-- Version 1 decoders reject packets where `version != 1`.
+- Version 2 decoders reject packets where `version != 2`.
 
 ### Additive evolution strategy (preferred)
-In v1+:
+In v2+:
 - allow unknown sections to be skipped (using `section_len`)
 - add optional sections without breaking older decoders
 

@@ -61,6 +61,9 @@ struct Cli {
     /// Output directory for summary.json.
     #[arg(long, default_value = "target/simbench")]
     out_dir: PathBuf,
+    /// Emit per-client breakdown details to stdout (visibility scenario only).
+    #[arg(long, default_value_t = false)]
+    debug_client_breakdown: bool,
     /// Fail if p95 delta packet size exceeds this value.
     #[arg(long)]
     max_p95_delta_bytes: Option<u64>,
@@ -106,6 +109,12 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let mut per_client_breakdown =
+        if cli.scenario == Scenario::Visibility && cli.debug_client_breakdown {
+            Some(ClientBreakdown::default())
+        } else {
+            None
+        };
     let mut client_baselines: Vec<codec::Snapshot> = Vec::new();
 
     for tick in 1..=cli.ticks {
@@ -152,6 +161,7 @@ fn main() -> Result<()> {
                 &mut scratch,
                 cli.visibility_radius_q,
                 per_client_stats.as_mut().expect("per-client stats"),
+                per_client_breakdown.as_mut(),
             )?;
         }
 
@@ -170,6 +180,9 @@ fn main() -> Result<()> {
 
     summary.assert_budgets(cli.max_p95_delta_bytes, cli.max_avg_delta_bytes)?;
     write_summary_json(&cli.out_dir, &summary)?;
+    if let Some(breakdown) = per_client_breakdown {
+        breakdown.print();
+    }
 
     if summary.sdec.delta_p95 > wire_limits.max_packet_bytes as u64 {
         anyhow::bail!(
@@ -245,6 +258,82 @@ fn encode_delta_for_client_with_scratch(
     .context("encode delta snapshot (client)")?;
     buf.truncate(bytes);
     Ok(buf)
+}
+
+#[derive(Default, Debug)]
+struct ClientBreakdown {
+    packets: u64,
+    packet_bytes: u64,
+    destroy_bytes: u64,
+    create_bytes: u64,
+    update_masked_bytes: u64,
+    update_sparse_bytes: u64,
+    update_entities: u64,
+    update_components: u64,
+    update_fields: u64,
+}
+
+impl ClientBreakdown {
+    fn print(&self) {
+        println!("client breakdown (visibility):");
+        println!("  packets: {}", self.packets);
+        println!(
+            "  section bytes: destroy={} create={} update_masked={} update_sparse={}",
+            self.destroy_bytes,
+            self.create_bytes,
+            self.update_masked_bytes,
+            self.update_sparse_bytes
+        );
+        if self.packets > 0 {
+            let avg_packet = self.packet_bytes as f64 / self.packets as f64;
+            let avg_update_bytes =
+                (self.update_masked_bytes + self.update_sparse_bytes) as f64 / self.packets as f64;
+            println!("  avg packet bytes: {:.1}", avg_packet);
+            println!("  avg update section bytes: {:.1}", avg_update_bytes);
+            println!("  avg overhead bytes: {:.1}", avg_packet - avg_update_bytes);
+        }
+        println!(
+            "  updates: entities={} components={} fields={}",
+            self.update_entities, self.update_components, self.update_fields
+        );
+    }
+}
+
+fn record_client_breakdown(
+    breakdown: &mut ClientBreakdown,
+    schema: &schema::Schema,
+    bytes: &[u8],
+) -> Result<()> {
+    let packet = wire::decode_packet(bytes, &WireLimits::default()).context("decode packet")?;
+    breakdown.packets += 1;
+    breakdown.packet_bytes += bytes.len() as u64;
+    for section in &packet.sections {
+        match section.tag {
+            wire::SectionTag::EntityDestroy => breakdown.destroy_bytes += section.body.len() as u64,
+            wire::SectionTag::EntityCreate => breakdown.create_bytes += section.body.len() as u64,
+            wire::SectionTag::EntityUpdate => {
+                breakdown.update_masked_bytes += section.body.len() as u64
+            }
+            wire::SectionTag::EntityUpdateSparse | wire::SectionTag::EntityUpdateSparsePacked => {
+                breakdown.update_sparse_bytes += section.body.len() as u64
+            }
+            _ => {}
+        }
+    }
+
+    if packet.header.flags.is_delta_snapshot() {
+        let decoded = codec::decode_delta_packet(schema, &packet, &CodecLimits::default())
+            .context("decode delta packet")?;
+        breakdown.update_entities += decoded.updates.len() as u64;
+        for entity in decoded.updates {
+            breakdown.update_components += entity.components.len() as u64;
+            for component in entity.components {
+                breakdown.update_fields += component.fields.len() as u64;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn encode_bincode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
@@ -672,6 +761,7 @@ fn run_visibility(
     scratch: &mut CodecScratch,
     radius_q: i64,
     stats: &mut PerClientStats,
+    mut breakdown: Option<&mut ClientBreakdown>,
 ) -> Result<()> {
     let radius_sq = radius_q * radius_q;
     for (idx, baseline) in baselines.iter_mut().enumerate() {
@@ -697,6 +787,9 @@ fn run_visibility(
                 &CodecLimits::default(),
                 scratch,
             )?;
+            if let Some(breakdown) = breakdown.as_mut() {
+                record_client_breakdown(breakdown, schema, &delta_bytes)?;
+            }
             let elapsed = start.elapsed();
             stats
                 .sdec

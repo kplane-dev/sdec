@@ -4,7 +4,7 @@ use crate::error::{DecodeError, EncodeError, LimitKind, SectionFramingError, Wir
 use crate::header::{PacketFlags, PacketHeader, HEADER_SIZE, MAGIC, VERSION};
 use crate::limits::Limits;
 
-/// Section tags for version 1.
+/// Section tags for version 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -13,6 +13,7 @@ pub enum SectionTag {
     EntityDestroy = 2,
     EntityUpdate = 3,
     EntityUpdateSparse = 4,
+    EntityUpdateSparsePacked = 5,
 }
 
 impl SectionTag {
@@ -23,6 +24,7 @@ impl SectionTag {
             2 => Ok(Self::EntityDestroy),
             3 => Ok(Self::EntityUpdate),
             4 => Ok(Self::EntityUpdateSparse),
+            5 => Ok(Self::EntityUpdateSparsePacked),
             _ => Err(DecodeError::UnknownSectionTag { tag }),
         }
     }

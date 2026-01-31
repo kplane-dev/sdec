@@ -207,7 +207,9 @@ fn print_inspect_report(report: &tools::InspectReport) {
     for section in &report.sections {
         let tag = format!("{:?}", section.tag);
         let label = match section.tag {
-            wire::SectionTag::EntityUpdateSparse => "entries",
+            wire::SectionTag::EntityUpdateSparse | wire::SectionTag::EntityUpdateSparsePacked => {
+                "entries"
+            }
             _ => "entities",
         };
         let count = section
@@ -219,9 +221,15 @@ fn print_inspect_report(report: &tools::InspectReport) {
     let update_encoding = if report
         .sections
         .iter()
+        .any(|section| section.tag == wire::SectionTag::EntityUpdateSparsePacked)
+    {
+        Some("sparse_packed")
+    } else if report
+        .sections
+        .iter()
         .any(|section| section.tag == wire::SectionTag::EntityUpdateSparse)
     {
-        Some("sparse")
+        Some("sparse_varint")
     } else if report
         .sections
         .iter()

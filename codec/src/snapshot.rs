@@ -390,6 +390,77 @@ pub(crate) fn write_field_value(
     Ok(())
 }
 
+pub(crate) fn write_field_value_sparse(
+    component_id: ComponentId,
+    field: FieldDef,
+    value: FieldValue,
+    writer: &mut BitWriter<'_>,
+) -> CodecResult<()> {
+    match (field.codec, value) {
+        (FieldCodec::Bool, FieldValue::Bool(v)) => writer.write_bit(v)?,
+        (FieldCodec::UInt { bits }, FieldValue::UInt(v)) => {
+            validate_uint(component_id, field.id, bits, v)?;
+            writer.write_bits(v, bits)?;
+        }
+        (FieldCodec::SInt { bits }, FieldValue::SInt(v)) => {
+            let encoded = encode_sint(component_id, field.id, bits, v)?;
+            writer.write_bits(encoded, bits)?;
+        }
+        (FieldCodec::VarUInt, FieldValue::VarUInt(v)) => {
+            if v > u32::MAX as u64 {
+                return Err(CodecError::InvalidValue {
+                    component: component_id,
+                    field: field.id,
+                    reason: ValueReason::VarUIntOutOfRange { value: v },
+                });
+            }
+            writer.align_to_byte()?;
+            writer.write_varu32(v as u32)?;
+        }
+        (FieldCodec::VarSInt, FieldValue::VarSInt(v)) => {
+            if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                return Err(CodecError::InvalidValue {
+                    component: component_id,
+                    field: field.id,
+                    reason: ValueReason::VarSIntOutOfRange { value: v },
+                });
+            }
+            writer.align_to_byte()?;
+            writer.write_vars32(v as i32)?;
+        }
+        (FieldCodec::FixedPoint(fp), FieldValue::FixedPoint(v)) => {
+            if v < fp.min_q || v > fp.max_q {
+                return Err(CodecError::InvalidValue {
+                    component: component_id,
+                    field: field.id,
+                    reason: ValueReason::FixedPointOutOfRange {
+                        min_q: fp.min_q,
+                        max_q: fp.max_q,
+                        value: v,
+                    },
+                });
+            }
+            let offset = (v - fp.min_q) as u64;
+            let range = (fp.max_q - fp.min_q) as u64;
+            let bits = required_bits(range);
+            if bits > 0 {
+                writer.write_bits(offset, bits)?;
+            }
+        }
+        _ => {
+            return Err(CodecError::InvalidValue {
+                component: component_id,
+                field: field.id,
+                reason: ValueReason::TypeMismatch {
+                    expected: codec_name(field.codec),
+                    found: value_name(value),
+                },
+            });
+        }
+    }
+    Ok(())
+}
+
 fn decode_create_section(
     schema: &schema::Schema,
     body: &[u8],
@@ -511,6 +582,58 @@ fn decode_component_fields(
 }
 
 pub(crate) fn read_field_value(
+    component_id: ComponentId,
+    field: FieldDef,
+    reader: &mut BitReader<'_>,
+) -> CodecResult<FieldValue> {
+    match field.codec {
+        FieldCodec::Bool => Ok(FieldValue::Bool(reader.read_bit()?)),
+        FieldCodec::UInt { bits } => {
+            let value = reader.read_bits(bits)?;
+            validate_uint(component_id, field.id, bits, value)?;
+            Ok(FieldValue::UInt(value))
+        }
+        FieldCodec::SInt { bits } => {
+            let raw = reader.read_bits(bits)?;
+            let value = decode_sint(bits, raw)?;
+            Ok(FieldValue::SInt(value))
+        }
+        FieldCodec::VarUInt => {
+            reader.align_to_byte()?;
+            let value = reader.read_varu32()? as u64;
+            Ok(FieldValue::VarUInt(value))
+        }
+        FieldCodec::VarSInt => {
+            reader.align_to_byte()?;
+            let value = reader.read_vars32()? as i64;
+            Ok(FieldValue::VarSInt(value))
+        }
+        FieldCodec::FixedPoint(fp) => {
+            let range = (fp.max_q - fp.min_q) as u64;
+            let bits = required_bits(range);
+            let offset = if bits == 0 {
+                0
+            } else {
+                reader.read_bits(bits)?
+            };
+            let value = fp.min_q + offset as i64;
+            if value < fp.min_q || value > fp.max_q {
+                return Err(CodecError::InvalidValue {
+                    component: component_id,
+                    field: field.id,
+                    reason: ValueReason::FixedPointOutOfRange {
+                        min_q: fp.min_q,
+                        max_q: fp.max_q,
+                        value,
+                    },
+                });
+            }
+            Ok(FieldValue::FixedPoint(value))
+        }
+    }
+}
+
+pub(crate) fn read_field_value_sparse(
     component_id: ComponentId,
     field: FieldDef,
     reader: &mut BitReader<'_>,

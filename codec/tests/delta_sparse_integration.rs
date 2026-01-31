@@ -60,7 +60,7 @@ fn delta_selects_sparse_encoding_for_sparse_change() {
     assert!(packet
         .sections
         .iter()
-        .any(|section| section.tag == SectionTag::EntityUpdateSparse));
+        .any(|section| section.tag == SectionTag::EntityUpdateSparsePacked));
 
     let applied = apply_delta_snapshot_from_packet(&schema, &baseline, &packet, &limits).unwrap();
     assert_eq!(applied.entities, current.entities);
@@ -127,7 +127,7 @@ fn delta_for_client_uses_sparse_encoding() {
     assert!(packet
         .sections
         .iter()
-        .any(|section| section.tag == SectionTag::EntityUpdateSparse));
+        .any(|section| section.tag == SectionTag::EntityUpdateSparsePacked));
 
     let applied =
         apply_delta_snapshot_from_packet(&schema, &baseline, &packet, &CodecLimits::for_testing())
