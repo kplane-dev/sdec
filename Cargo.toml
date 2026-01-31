@@ -6,6 +6,8 @@ members = [
     "schema",
     "codec",
     "tools",
+    "demo-schema",
+    "demo-sim",
     "simbench",
 ]
 exclude = ["fuzz"]
@@ -37,6 +39,7 @@ bitstream = { path = "bitstream", version = "0.4.0", package = "sdec-bitstream" 
 wire = { path = "wire", version = "0.4.0", package = "sdec-wire" }
 schema = { path = "schema", version = "0.4.0", package = "sdec-schema" }
 codec = { path = "codec", version = "0.4.0", package = "sdec-codec" }
+tools = { path = "tools", version = "0.4.0" }
 
 # Testing
 proptest = "1.4"

@@ -163,7 +163,12 @@ fn collect_packet_entries(dir: &PathBuf, glob: Option<&str>) -> Result<Vec<Packe
             continue;
         }
         if let Some(pattern) = &pattern {
-            if !pattern.matches_path(&path) {
+            let matches_path = pattern.matches_path(&path);
+            let matches_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| pattern.matches(name));
+            if !matches_path && !matches_name {
                 continue;
             }
         }

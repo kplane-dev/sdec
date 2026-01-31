@@ -93,6 +93,16 @@ cargo run -p tools -- decode packet.bin --schema schema.json --format pretty
 
 Schema JSON is available via the optional `serde` feature on the `schema` crate.
 
+## Demo Simulation
+
+Generate deterministic captures and a summary report:
+
+```bash
+cargo run -p demo-sim -- --players 16 --ticks 300 --seed 1 --out-dir captures
+```
+
+This writes `schema.json`, `full_*.bin`, `delta_*.bin`, and `summary.json` to the output directory.
+
 ## Building
 
 ```bash
