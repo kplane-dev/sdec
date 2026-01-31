@@ -1,6 +1,6 @@
 # Architecture
 
-This repo implements a transport-agnostic snapshot + delta codec for fast-paced multiplayer games (FPS-style).
+This repo implements a transport-agnostic snapshot + delta codec for realtime state synchronization.
 It focuses on: bit-packed encoding, quantization, baseline/ACK-driven delta compression, and correctness-first decoding.
 
 The codec is **bytes in / bytes out**. It does not open sockets, manage connections, or assume any game engine/ECS.

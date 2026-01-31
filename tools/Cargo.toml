@@ -1,0 +1,20 @@
+[package]
+name = "tools"
+description = "Introspection and debugging tools for the sdec codec"
+publish = false
+readme = "../README.md"
+keywords = ["netcode", "tools", "snapshot", "delta", "debugging"]
+categories = ["network-programming", "game-development", "encoding"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitstream.workspace = true
+wire.workspace = true
+schema.workspace = true
+codec.workspace = true
+
+[dev-dependencies]

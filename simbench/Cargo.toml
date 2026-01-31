@@ -1,0 +1,25 @@
+[package]
+name = "simbench"
+description = "Scenario generation and benchmarking for the sdec codec"
+publish = false
+readme = "../README.md"
+keywords = ["netcode", "benchmark", "simulation", "snapshot", "delta"]
+categories = ["network-programming", "game-development", "encoding"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bitstream.workspace = true
+wire.workspace = true
+schema.workspace = true
+codec.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "encode_decode"
+harness = false

@@ -1,0 +1,20 @@
+[package]
+name = "sdec-bitstream"
+description = "Low-level bit packing primitives for the sdec codec"
+readme = "../README.md"
+keywords = ["netcode", "bitstream", "bitpacking", "snapshot", "delta"]
+categories = ["network-programming", "game-development", "encoding"]
+documentation = "https://docs.rs/sdec-bitstream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "bitstream"
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true

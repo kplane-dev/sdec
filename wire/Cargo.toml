@@ -1,0 +1,21 @@
+[package]
+name = "sdec-wire"
+description = "Wire framing and packet layout for the sdec codec"
+readme = "../README.md"
+keywords = ["netcode", "wire", "snapshot", "delta", "protocol"]
+categories = ["network-programming", "game-development", "encoding"]
+documentation = "https://docs.rs/sdec-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "wire"
+
+[dependencies]
+bitstream.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
