@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, default_value_t = 0.25)]
     burst_fraction: f32,
     /// Burst amplitude in quantized units.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 1000)]
     burst_amplitude_q: i64,
     /// Number of clients to evaluate (visibility scenario).
     #[arg(long, default_value_t = 4)]
