@@ -156,9 +156,16 @@ fn decode_session_init_body(
             remaining_bits: reader.bits_remaining(),
         });
     }
-    let compact_mode = CompactHeaderMode::from_raw(mode)
-        .ok_or(CodecError::SessionUnsupportedMode { mode })?;
-    Ok((if session_id == 0 { None } else { Some(session_id) }, compact_mode))
+    let compact_mode =
+        CompactHeaderMode::from_raw(mode).ok_or(CodecError::SessionUnsupportedMode { mode })?;
+    Ok((
+        if session_id == 0 {
+            None
+        } else {
+            Some(session_id)
+        },
+        compact_mode,
+    ))
 }
 
 /// Decodes a compact packet using session state.
@@ -174,8 +181,8 @@ pub fn decode_session_packet<'a>(
             found: session.schema_hash,
         });
     }
-    let header = wire::decode_session_header(bytes, session.last_tick.raw())
-        .map_err(CodecError::Wire)?;
+    let header =
+        wire::decode_session_header(bytes, session.last_tick.raw()).map_err(CodecError::Wire)?;
     if header.tick <= session.last_tick.raw() {
         return Err(CodecError::SessionOutOfOrder {
             previous: session.last_tick.raw(),

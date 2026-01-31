@@ -21,8 +21,8 @@ mod baseline;
 mod delta;
 mod error;
 mod limits;
-mod session;
 mod scratch;
+mod session;
 mod snapshot;
 mod types;
 
@@ -35,13 +35,13 @@ pub use delta::{
     encode_delta_snapshot_for_client_with_scratch, encode_delta_snapshot_with_scratch,
     select_baseline_tick, DeltaDecoded, DeltaUpdateComponent, DeltaUpdateEntity,
 };
-pub use session::{
-    decode_session_init_packet, decode_session_packet, encode_session_init_packet, CompactHeaderMode,
-    SessionState,
-};
 pub use error::{CodecError, CodecResult, LimitKind, MaskKind, MaskReason, ValueReason};
 pub use limits::CodecLimits;
 pub use scratch::CodecScratch;
+pub use session::{
+    decode_session_init_packet, decode_session_packet, encode_session_init_packet,
+    CompactHeaderMode, SessionState,
+};
 pub use snapshot::{
     decode_full_snapshot, decode_full_snapshot_from_packet, encode_full_snapshot,
     ComponentSnapshot, EntitySnapshot, FieldValue, Snapshot,

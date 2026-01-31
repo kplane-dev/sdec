@@ -76,7 +76,7 @@ impl PacketFlags {
     /// Valid means either:
     /// - session init set alone (no full/delta), or
     /// - exactly one of full/delta set, with no session init,
-    /// and no reserved bits are set.
+    ///   and no reserved bits are set.
     #[must_use]
     pub const fn is_valid_v2(self) -> bool {
         let has_full = self.is_full_snapshot();

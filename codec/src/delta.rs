@@ -103,6 +103,7 @@ pub fn encode_delta_snapshot_for_client(
 }
 
 /// Encodes a client delta snapshot using a compact session header.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_delta_snapshot_for_client_session(
     schema: &schema::Schema,
     tick: SnapshotTick,
