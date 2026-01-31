@@ -119,7 +119,7 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 
 - Deterministic scenario generators (movement, bursts, spawns).
 - Loss/reorder simulation to verify resync behavior.
-- Benchmark output in JSON/CSV for CI regression checks.
+- Simbench harness emits `summary.json` (bytes/timing) and baseline comparisons.
 
 ### `demo-schema/` and `demo-sim/`
 **Responsibility:** reference demo schema + deterministic capture generator.

@@ -105,6 +105,23 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
+  simbench:
+    name: Simbench Harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run simbench
+        run: |
+          cargo run -p simbench -- \
+            --players 16 \
+            --ticks 300 \
+            --seed 1 \
+            --out-dir target/simbench \
+            --max-p95-delta-bytes 4096 \
+            --max-avg-delta-bytes 2048
+
   # Ensure fuzz targets compile (actual fuzzing runs periodically, not on every PR)
   fuzz-check:
     name: Fuzz Targets Compile

@@ -47,4 +47,5 @@ This project follows Semantic Versioning for pre-1.0 releases.
 - `demo-schema` and `demo-sim` reference crates for deterministic captures.
 - Capture output (`schema.json`, `full_*.bin`, `delta_*.bin`, `summary.json`).
 - CI demo simulation run with size budget checks.
+- Simbench harness with baseline encoders and `summary.json` output.
 
