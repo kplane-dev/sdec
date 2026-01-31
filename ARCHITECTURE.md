@@ -53,15 +53,15 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 - **No domain knowledge** (no entities/components).
 
 **Notes**
-- Aim for `#![forbid(unsafe_code)]` in v0/v1. Revisit only with proof from profiling.
+- Aim for `#![forbid(unsafe_code)]` in early releases. Revisit only with proof from profiling.
 - Make bounds checks explicit and exhaustive.
 
 ### `wire/`
 **Responsibility:** wire framing and canonical binary layout.
 
 - Packet header encode/decode.
-- Section tags and minimal section parsing.
-- Limit checks that apply before allocating/iterating.
+- Section tags and framing; section bodies are returned as byte slices.
+- Wire-level limit checks only (packet/section bounds).
 
 **Notes**
 - `wire` does not know about the game state types—only the structure of the packet.
@@ -70,7 +70,7 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 ### `schema/`
 **Responsibility:** represent replication schemas and field codecs.
 
-- Runtime schema model (v0).
+- Runtime schema model (initial release).
 - Deterministic `schema_hash`.
 - Field codec descriptors:
   - `Bool`, `UInt`, `SInt`, `VarUInt`, `VarSInt`
@@ -81,8 +81,8 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
   - change threshold config (for delta emission)
 
 **Notes**
-- v0 starts runtime-first. Derive macros can come in v1.
-- Avoid runtime reflection on arbitrary Rust types in v0; keep schema explicit.
+- The initial release is runtime-first. Derive macros can come in a later release.
+- Avoid runtime reflection on arbitrary Rust types in the initial release; keep schema explicit.
 
 ### `codec/`
 **Responsibility:** snapshot/delta logic.
@@ -94,7 +94,7 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 
 **Key types**
 - `SnapshotTick` (u32)
-- `EntityId` (u32 in v0; widenable later with a type alias)
+- `EntityId` (u32 in the initial release; widenable later with a type alias)
 - `Schema` (from `schema`)
 - `CodecLimits` (hard bounds used by codec and wire)
 
@@ -184,7 +184,7 @@ Every PR must add tests proportional to the surface it changes.
 - Chaos tests in `simbench` for loss/reorder recovery.
 
 ### “No compromise” checks
-- `deny` unsafe in v0/v1.
+- `deny` unsafe in early releases.
 - `clippy -D warnings`, `fmt`, `cargo test` in CI.
 - Fuzz targets must compile in CI (running fuzz in CI can be periodic).
 
@@ -206,4 +206,4 @@ We stay flexible by:
 - reserving extension points via optional sections and flags.
 
 We do **not** include speculative fields “just in case.”
-Everything in v0 is justified by immediate delta snapshot needs.
+Everything in the initial release is justified by immediate delta snapshot needs.

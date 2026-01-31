@@ -16,7 +16,7 @@
 
 ## Status
 
-🚧 **Work in Progress** — Currently implementing v0 (core codec + stable wire format).
+🚧 **Work in Progress** — Currently implementing the initial core release (codec + stable wire format).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](WIRE_FORMAT.md) for the binary protocol specification.
 
@@ -34,7 +34,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](W
 ## Quick Start
 
 ```rust
-// Example usage (coming in v0)
+// Example usage (coming in the initial release)
 use codec::{Encoder, Decoder, Schema};
 
 // Define your schema

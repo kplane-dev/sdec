@@ -15,10 +15,14 @@
 mod error;
 mod header;
 mod limits;
+mod packet;
 
-pub use error::{WireError, WireResult};
+pub use error::{DecodeError, EncodeError, LimitKind, SectionFramingError, WireResult};
 pub use header::{PacketFlags, PacketHeader, HEADER_SIZE, MAGIC, VERSION};
 pub use limits::Limits;
+pub use packet::{
+    decode_packet, encode_header, encode_section, SectionTag, WirePacket, WireSection,
+};
 
 #[cfg(test)]
 mod tests {
@@ -34,6 +38,7 @@ mod tests {
         let _ = PacketFlags::full_snapshot();
         let _ = PacketHeader::full_snapshot(0, 0, 0);
         let _ = Limits::default();
+        let _ = SectionTag::EntityCreate;
 
         // Error types
         let _: WireResult<()> = Ok(());
@@ -42,14 +47,14 @@ mod tests {
     #[test]
     fn limits_default_is_reasonable() {
         let limits = Limits::default();
-        // Should be able to handle typical FPS scenarios
+        // Should be able to handle typical realtime scenarios
         assert!(
             limits.max_packet_bytes >= 1024,
             "should allow at least 1KB packets"
         );
         assert!(
-            limits.max_entities_update >= 64,
-            "should allow at least 64 entity updates"
+            limits.max_section_len >= 512,
+            "should allow useful section sizes"
         );
     }
 

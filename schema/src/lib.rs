@@ -8,7 +8,7 @@
 //!
 //! # Design Principles
 //!
-//! - **Runtime-first** - v0 uses runtime schema building, derive macros come later.
+//! - **Runtime-first** - the initial release uses runtime schema building; derive macros come later.
 //! - **Explicit schemas** - No reflection on arbitrary Rust types.
 //! - **Deterministic hashing** - Schema hash is stable given the same definition.
 
