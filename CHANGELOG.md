@@ -41,6 +41,16 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.6.0] - 2026-01-31
+
+### Added
+- On-wire session init packets for schema/hash negotiation and compact header mode.
+- Compact session header and per-client delta encoding/decoding path.
+- Session state validation for schema/tick/baseline rules.
+
+### Changed
+- Bump workspace and internal crate versions to 0.6.0.
+
 ## [0.5.0] - 2026-01-31
 
 ### Added
