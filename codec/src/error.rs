@@ -54,6 +54,9 @@ pub enum CodecError {
     /// Duplicate section encountered.
     DuplicateSection { section: wire::SectionTag },
 
+    /// Multiple update encodings present in one packet.
+    DuplicateUpdateEncoding,
+
     /// Baseline tick does not match the packet.
     BaselineTickMismatch { expected: u32, found: u32 },
 
@@ -116,6 +119,8 @@ pub enum MaskReason {
     FieldCountMismatch { expected: usize, actual: usize },
     MissingField { field: FieldId },
     UnknownComponent { component: ComponentId },
+    InvalidComponentId { raw: u16 },
+    InvalidFieldIndex { field_index: usize, max: usize },
     ComponentPresenceMismatch { component: ComponentId },
     EmptyFieldMask { component: ComponentId },
 }
@@ -197,6 +202,9 @@ impl fmt::Display for CodecError {
             Self::DuplicateSection { section } => {
                 write!(f, "duplicate section {section:?} in packet")
             }
+            Self::DuplicateUpdateEncoding => {
+                write!(f, "multiple update encodings present in packet")
+            }
             Self::BaselineTickMismatch { expected, found } => {
                 write!(
                     f,
@@ -269,6 +277,12 @@ impl fmt::Display for MaskReason {
             }
             Self::UnknownComponent { component } => {
                 write!(f, "unknown component {component:?} in snapshot")
+            }
+            Self::InvalidComponentId { raw } => {
+                write!(f, "invalid component id {raw} in snapshot")
+            }
+            Self::InvalidFieldIndex { field_index, max } => {
+                write!(f, "field index {field_index} exceeds max {max}")
             }
             Self::ComponentPresenceMismatch { component } => {
                 write!(f, "component presence mismatch for {component:?}")

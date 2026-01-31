@@ -1,5 +1,7 @@
 //! Delta snapshot encoding/decoding.
 
+use std::cmp::Ordering;
+
 use bitstream::{BitReader, BitWriter};
 use schema::{schema_hash, ChangePolicy, ComponentDef, ComponentId, FieldDef};
 use wire::{decode_packet, encode_header, SectionTag, WirePacket};
@@ -122,22 +124,37 @@ pub fn encode_delta_snapshot_with_scratch(
         offset += written;
     }
     if counts.updates > 0 {
-        let written = write_section(
-            SectionTag::EntityUpdate,
-            &mut out[offset..],
-            limits,
-            |writer| {
-                encode_update_body(
-                    schema,
-                    baseline,
-                    current,
-                    counts.updates,
-                    limits,
-                    scratch,
-                    writer,
-                )
-            },
-        )?;
+        let update_encoding = select_update_encoding(schema, baseline, current, limits, scratch)?;
+        let section_tag = match update_encoding {
+            UpdateEncoding::Masked => SectionTag::EntityUpdate,
+            UpdateEncoding::Sparse => SectionTag::EntityUpdateSparse,
+        };
+        let written =
+            write_section(
+                section_tag,
+                &mut out[offset..],
+                limits,
+                |writer| match update_encoding {
+                    UpdateEncoding::Masked => encode_update_body_masked(
+                        schema,
+                        baseline,
+                        current,
+                        counts.updates,
+                        limits,
+                        scratch,
+                        writer,
+                    ),
+                    UpdateEncoding::Sparse => encode_update_body_sparse(
+                        schema,
+                        baseline,
+                        current,
+                        counts.updates,
+                        limits,
+                        scratch,
+                        writer,
+                    ),
+                },
+            )?;
         offset += written;
     }
 
@@ -270,6 +287,12 @@ struct DiffCounts {
     destroys: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateEncoding {
+    Masked,
+    Sparse,
+}
+
 fn diff_counts(
     schema: &schema::Schema,
     baseline: &Snapshot,
@@ -310,6 +333,119 @@ fn diff_counts(
         }
     }
     Ok(())
+}
+
+fn select_update_encoding(
+    schema: &schema::Schema,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+) -> CodecResult<UpdateEncoding> {
+    let component_count = schema.components.len();
+    let mut mask_bytes = 0usize;
+    let mut sparse_index_bytes = 0usize;
+    let mut baseline_iter = baseline.entities.iter();
+    let mut current_iter = current.entities.iter();
+    let mut baseline_next = baseline_iter.next();
+    let mut current_next = current_iter.next();
+
+    while let (Some(base), Some(curr)) = (baseline_next, current_next) {
+        match base.id.cmp(&curr.id) {
+            Ordering::Less => {
+                baseline_next = baseline_iter.next();
+            }
+            Ordering::Greater => {
+                current_next = current_iter.next();
+            }
+            Ordering::Equal => {
+                for component in &schema.components {
+                    let base_component = find_component(base, component.id);
+                    let curr_component = find_component(curr, component.id);
+                    if base_component.is_some() != curr_component.is_some() {
+                        return Err(CodecError::InvalidMask {
+                            kind: MaskKind::ComponentMask,
+                            reason: MaskReason::ComponentPresenceMismatch {
+                                component: component.id,
+                            },
+                        });
+                    }
+                    if let (Some(base_component), Some(curr_component)) =
+                        (base_component, curr_component)
+                    {
+                        if base_component.fields.len() != component.fields.len()
+                            || curr_component.fields.len() != component.fields.len()
+                        {
+                            return Err(CodecError::InvalidMask {
+                                kind: MaskKind::FieldMask {
+                                    component: component.id,
+                                },
+                                reason: MaskReason::FieldCountMismatch {
+                                    expected: component.fields.len(),
+                                    actual: base_component
+                                        .fields
+                                        .len()
+                                        .max(curr_component.fields.len()),
+                                },
+                            });
+                        }
+                        if component.fields.len() > limits.max_fields_per_component {
+                            return Err(CodecError::LimitsExceeded {
+                                kind: LimitKind::FieldsPerComponent,
+                                limit: limits.max_fields_per_component,
+                                actual: component.fields.len(),
+                            });
+                        }
+                        let (_, field_mask) = scratch
+                            .component_and_field_masks_mut(component_count, component.fields.len());
+                        // Use the same change predicate as masked/sparse encoding.
+                        let field_mask = compute_field_mask_into(
+                            component,
+                            base_component,
+                            curr_component,
+                            field_mask,
+                        )?;
+                        let changed = field_mask.iter().filter(|bit| **bit).count();
+                        if changed > 0 {
+                            let field_count = component.fields.len();
+                            // Compare per-component mask bytes vs sparse index list bytes.
+                            // Values are sent in both encodings, so we only estimate index/mask overhead.
+                            mask_bytes += field_count.div_ceil(8);
+                            sparse_index_bytes += varu32_len(changed as u32)
+                                + changed * varu32_len((field_count - 1) as u32);
+                        }
+                    }
+                }
+
+                baseline_next = baseline_iter.next();
+                current_next = current_iter.next();
+            }
+        }
+    }
+
+    if mask_bytes == 0 {
+        return Ok(UpdateEncoding::Masked);
+    }
+
+    if sparse_index_bytes <= mask_bytes {
+        Ok(UpdateEncoding::Sparse)
+    } else {
+        Ok(UpdateEncoding::Masked)
+    }
+}
+
+fn varu32_len(value: u32) -> usize {
+    if value < (1 << 7) {
+        1
+    } else if value < (1 << 14) {
+        2
+    } else if value < (1 << 21) {
+        3
+    } else if value < (1 << 28) {
+        4
+    } else {
+        5
+    }
 }
 
 fn encode_destroy_body(
@@ -415,7 +551,7 @@ fn encode_create_body(
     Ok(())
 }
 
-fn encode_update_body(
+fn encode_update_body_masked(
     schema: &schema::Schema,
     baseline: &Snapshot,
     current: &Snapshot,
@@ -465,6 +601,216 @@ fn encode_update_body(
 
     writer.align_to_byte()?;
     Ok(())
+}
+
+fn encode_update_body_sparse(
+    schema: &schema::Schema,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    update_count: usize,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+    writer: &mut BitWriter<'_>,
+) -> CodecResult<()> {
+    if update_count > limits.max_entities_update {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: limits.max_entities_update,
+            actual: update_count,
+        });
+    }
+
+    let entry_count = count_sparse_update_entries(schema, baseline, current, limits, scratch)?;
+    let entry_limit = limits
+        .max_entities_update
+        .saturating_mul(limits.max_components_per_entity);
+    if entry_count > entry_limit {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: entry_limit,
+            actual: entry_count,
+        });
+    }
+
+    writer.align_to_byte()?;
+    writer.write_varu32(entry_count as u32)?;
+
+    let mut baseline_iter = baseline.entities.iter();
+    let mut current_iter = current.entities.iter();
+    let mut baseline_next = baseline_iter.next();
+    let mut current_next = current_iter.next();
+    let component_count = schema.components.len();
+
+    while let (Some(base), Some(curr)) = (baseline_next, current_next) {
+        match base.id.cmp(&curr.id) {
+            Ordering::Less => {
+                baseline_next = baseline_iter.next();
+            }
+            Ordering::Greater => {
+                current_next = current_iter.next();
+            }
+            Ordering::Equal => {
+                if entity_has_updates(schema, base, curr, limits)? {
+                    for component in &schema.components {
+                        let base_component = find_component(base, component.id);
+                        let curr_component = find_component(curr, component.id);
+                        if base_component.is_some() != curr_component.is_some() {
+                            return Err(CodecError::InvalidMask {
+                                kind: MaskKind::ComponentMask,
+                                reason: MaskReason::ComponentPresenceMismatch {
+                                    component: component.id,
+                                },
+                            });
+                        }
+                        if let (Some(base_component), Some(curr_component)) =
+                            (base_component, curr_component)
+                        {
+                            if base_component.fields.len() != component.fields.len()
+                                || curr_component.fields.len() != component.fields.len()
+                            {
+                                return Err(CodecError::InvalidMask {
+                                    kind: MaskKind::FieldMask {
+                                        component: component.id,
+                                    },
+                                    reason: MaskReason::FieldCountMismatch {
+                                        expected: component.fields.len(),
+                                        actual: base_component
+                                            .fields
+                                            .len()
+                                            .max(curr_component.fields.len()),
+                                    },
+                                });
+                            }
+                            if component.fields.len() > limits.max_fields_per_component {
+                                return Err(CodecError::LimitsExceeded {
+                                    kind: LimitKind::FieldsPerComponent,
+                                    limit: limits.max_fields_per_component,
+                                    actual: component.fields.len(),
+                                });
+                            }
+                            let (_, field_mask) = scratch.component_and_field_masks_mut(
+                                component_count,
+                                component.fields.len(),
+                            );
+                            let field_mask = compute_field_mask_into(
+                                component,
+                                base_component,
+                                curr_component,
+                                field_mask,
+                            )?;
+                            let changed_fields = field_mask.iter().filter(|bit| **bit).count();
+                            if changed_fields > 0 {
+                                writer.align_to_byte()?;
+                                writer.write_u32_aligned(curr.id.raw())?;
+                                writer.write_u16_aligned(component.id.get())?;
+                                writer.write_varu32(changed_fields as u32)?;
+                                for (idx, field) in component.fields.iter().enumerate() {
+                                    if field_mask[idx] {
+                                        writer.align_to_byte()?;
+                                        writer.write_varu32(idx as u32)?;
+                                        write_field_value(
+                                            component.id,
+                                            *field,
+                                            curr_component.fields[idx],
+                                            writer,
+                                        )?;
+                                        writer.align_to_byte()?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                baseline_next = baseline_iter.next();
+                current_next = current_iter.next();
+            }
+        }
+    }
+
+    writer.align_to_byte()?;
+    Ok(())
+}
+
+fn count_sparse_update_entries(
+    schema: &schema::Schema,
+    baseline: &Snapshot,
+    current: &Snapshot,
+    limits: &CodecLimits,
+    scratch: &mut CodecScratch,
+) -> CodecResult<usize> {
+    let component_count = schema.components.len();
+    let mut count = 0usize;
+    let mut baseline_iter = baseline.entities.iter();
+    let mut current_iter = current.entities.iter();
+    let mut baseline_next = baseline_iter.next();
+    let mut current_next = current_iter.next();
+
+    while let (Some(base), Some(curr)) = (baseline_next, current_next) {
+        match base.id.cmp(&curr.id) {
+            Ordering::Less => baseline_next = baseline_iter.next(),
+            Ordering::Greater => current_next = current_iter.next(),
+            Ordering::Equal => {
+                if entity_has_updates(schema, base, curr, limits)? {
+                    for component in &schema.components {
+                        let base_component = find_component(base, component.id);
+                        let curr_component = find_component(curr, component.id);
+                        if base_component.is_some() != curr_component.is_some() {
+                            return Err(CodecError::InvalidMask {
+                                kind: MaskKind::ComponentMask,
+                                reason: MaskReason::ComponentPresenceMismatch {
+                                    component: component.id,
+                                },
+                            });
+                        }
+                        if let (Some(base_component), Some(curr_component)) =
+                            (base_component, curr_component)
+                        {
+                            if base_component.fields.len() != component.fields.len()
+                                || curr_component.fields.len() != component.fields.len()
+                            {
+                                return Err(CodecError::InvalidMask {
+                                    kind: MaskKind::FieldMask {
+                                        component: component.id,
+                                    },
+                                    reason: MaskReason::FieldCountMismatch {
+                                        expected: component.fields.len(),
+                                        actual: base_component
+                                            .fields
+                                            .len()
+                                            .max(curr_component.fields.len()),
+                                    },
+                                });
+                            }
+                            if component.fields.len() > limits.max_fields_per_component {
+                                return Err(CodecError::LimitsExceeded {
+                                    kind: LimitKind::FieldsPerComponent,
+                                    limit: limits.max_fields_per_component,
+                                    actual: component.fields.len(),
+                                });
+                            }
+                            let (_, field_mask) = scratch.component_and_field_masks_mut(
+                                component_count,
+                                component.fields.len(),
+                            );
+                            let field_mask = compute_field_mask_into(
+                                component,
+                                base_component,
+                                curr_component,
+                                field_mask,
+                            )?;
+                            if field_mask.iter().any(|bit| *bit) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                baseline_next = baseline_iter.next();
+                current_next = current_iter.next();
+            }
+        }
+    }
+
+    Ok(count)
 }
 
 fn write_create_entity(
@@ -605,7 +951,7 @@ fn decode_create_section(
     Ok(entities)
 }
 
-fn decode_update_section(
+fn decode_update_section_masked(
     schema: &schema::Schema,
     body: &[u8],
     limits: &CodecLimits,
@@ -676,6 +1022,181 @@ fn decode_update_section(
     Ok(updates)
 }
 
+fn decode_update_section_sparse(
+    schema: &schema::Schema,
+    body: &[u8],
+    limits: &CodecLimits,
+) -> CodecResult<Vec<DeltaUpdateEntity>> {
+    if body.len() > limits.max_section_bytes {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::SectionBytes,
+            limit: limits.max_section_bytes,
+            actual: body.len(),
+        });
+    }
+
+    let mut reader = BitReader::new(body);
+    reader.align_to_byte()?;
+    let entry_count = reader.read_varu32()? as usize;
+    let entry_limit = limits
+        .max_entities_update
+        .saturating_mul(limits.max_components_per_entity);
+    if entry_count > entry_limit {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: entry_limit,
+            actual: entry_count,
+        });
+    }
+
+    let mut updates: Vec<DeltaUpdateEntity> = Vec::new();
+    let mut prev_entity: Option<u32> = None;
+    let mut prev_component: Option<u16> = None;
+    for _ in 0..entry_count {
+        reader.align_to_byte()?;
+        let entity_id = reader.read_u32_aligned()?;
+        let component_raw = reader.read_u16_aligned()?;
+        let component_id = ComponentId::new(component_raw).ok_or(CodecError::InvalidMask {
+            kind: MaskKind::ComponentMask,
+            reason: MaskReason::InvalidComponentId { raw: component_raw },
+        })?;
+        if let Some(prev) = prev_entity {
+            if entity_id < prev {
+                return Err(CodecError::InvalidEntityOrder {
+                    previous: prev,
+                    current: entity_id,
+                });
+            }
+            if entity_id == prev {
+                if let Some(prev_component) = prev_component {
+                    if component_raw <= prev_component {
+                        return Err(CodecError::InvalidEntityOrder {
+                            previous: prev,
+                            current: entity_id,
+                        });
+                    }
+                }
+            }
+        }
+        prev_entity = Some(entity_id);
+        prev_component = Some(component_raw);
+
+        let component = schema
+            .components
+            .iter()
+            .find(|component| component.id == component_id)
+            .ok_or(CodecError::InvalidMask {
+                kind: MaskKind::ComponentMask,
+                reason: MaskReason::UnknownComponent {
+                    component: component_id,
+                },
+            })?;
+
+        let field_count = reader.read_varu32()? as usize;
+        if field_count == 0 {
+            return Err(CodecError::InvalidMask {
+                kind: MaskKind::FieldMask {
+                    component: component.id,
+                },
+                reason: MaskReason::EmptyFieldMask {
+                    component: component.id,
+                },
+            });
+        }
+        if field_count > limits.max_fields_per_component {
+            return Err(CodecError::LimitsExceeded {
+                kind: LimitKind::FieldsPerComponent,
+                limit: limits.max_fields_per_component,
+                actual: field_count,
+            });
+        }
+        if field_count > component.fields.len() {
+            return Err(CodecError::InvalidMask {
+                kind: MaskKind::FieldMask {
+                    component: component.id,
+                },
+                reason: MaskReason::FieldCountMismatch {
+                    expected: component.fields.len(),
+                    actual: field_count,
+                },
+            });
+        }
+
+        let mut fields = Vec::with_capacity(field_count);
+        let mut prev_index: Option<usize> = None;
+        for _ in 0..field_count {
+            reader.align_to_byte()?;
+            let field_index = reader.read_varu32()? as usize;
+            if field_index >= component.fields.len() {
+                return Err(CodecError::InvalidMask {
+                    kind: MaskKind::FieldMask {
+                        component: component.id,
+                    },
+                    reason: MaskReason::InvalidFieldIndex {
+                        field_index,
+                        max: component.fields.len(),
+                    },
+                });
+            }
+            if let Some(prev_index) = prev_index {
+                if field_index <= prev_index {
+                    return Err(CodecError::InvalidMask {
+                        kind: MaskKind::FieldMask {
+                            component: component.id,
+                        },
+                        reason: MaskReason::InvalidFieldIndex {
+                            field_index,
+                            max: component.fields.len(),
+                        },
+                    });
+                }
+            }
+            prev_index = Some(field_index);
+            let field = component.fields[field_index];
+            let value = read_field_value(component.id, field, &mut reader)?;
+            fields.push((field_index, value));
+            reader.align_to_byte()?;
+        }
+
+        if let Some(last) = updates.last_mut() {
+            if last.id.raw() == entity_id {
+                last.components.push(DeltaUpdateComponent {
+                    id: component.id,
+                    fields,
+                });
+                continue;
+            }
+        }
+
+        updates.push(DeltaUpdateEntity {
+            id: EntityId::new(entity_id),
+            components: vec![DeltaUpdateComponent {
+                id: component.id,
+                fields,
+            }],
+        });
+    }
+
+    reader.align_to_byte()?;
+    if reader.bits_remaining() != 0 {
+        return Err(CodecError::TrailingSectionData {
+            section: SectionTag::EntityUpdateSparse,
+            remaining_bits: reader.bits_remaining(),
+        });
+    }
+
+    let unique_entities = updates.len();
+    if unique_entities > limits.max_entities_update {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: limits.max_entities_update,
+            actual: unique_entities,
+        });
+    }
+
+    Ok(updates)
+}
+
 fn decode_delta_sections(
     schema: &schema::Schema,
     packet: &WirePacket<'_>,
@@ -683,7 +1204,8 @@ fn decode_delta_sections(
 ) -> CodecResult<(Vec<EntityId>, Vec<EntitySnapshot>, Vec<DeltaUpdateEntity>)> {
     let mut destroys: Option<Vec<EntityId>> = None;
     let mut creates: Option<Vec<EntitySnapshot>> = None;
-    let mut updates: Option<Vec<DeltaUpdateEntity>> = None;
+    let mut updates_masked: Option<Vec<DeltaUpdateEntity>> = None;
+    let mut updates_sparse: Option<Vec<DeltaUpdateEntity>> = None;
 
     for section in &packet.sections {
         match section.tag {
@@ -704,12 +1226,20 @@ fn decode_delta_sections(
                 creates = Some(decode_create_section(schema, section.body, limits)?);
             }
             SectionTag::EntityUpdate => {
-                if updates.is_some() {
+                if updates_masked.is_some() {
                     return Err(CodecError::DuplicateSection {
                         section: section.tag,
                     });
                 }
-                updates = Some(decode_update_section(schema, section.body, limits)?);
+                updates_masked = Some(decode_update_section_masked(schema, section.body, limits)?);
+            }
+            SectionTag::EntityUpdateSparse => {
+                if updates_sparse.is_some() {
+                    return Err(CodecError::DuplicateSection {
+                        section: section.tag,
+                    });
+                }
+                updates_sparse = Some(decode_update_section_sparse(schema, section.body, limits)?);
             }
             _ => {
                 return Err(CodecError::UnexpectedSection {
@@ -722,7 +1252,12 @@ fn decode_delta_sections(
     Ok((
         destroys.unwrap_or_default(),
         creates.unwrap_or_default(),
-        updates.unwrap_or_default(),
+        match (updates_masked, updates_sparse) {
+            (Some(_), Some(_)) => return Err(CodecError::DuplicateUpdateEncoding),
+            (Some(updates), None) => updates,
+            (None, Some(updates)) => updates,
+            (None, None) => Vec::new(),
+        },
     ))
 }
 
@@ -1438,6 +1973,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(applied_two.entities, current_two.entities);
+    }
+
+    #[test]
+    fn delta_rejects_both_update_encodings() {
+        let schema = schema_one_bool();
+        let baseline = baseline_snapshot();
+        let update_body = [0u8; 1];
+        let mut update_section = [0u8; 8];
+        let update_len =
+            wire::encode_section(SectionTag::EntityUpdate, &update_body, &mut update_section)
+                .unwrap();
+
+        let mut sparse_section = [0u8; 8];
+        let sparse_len = wire::encode_section(
+            SectionTag::EntityUpdateSparse,
+            &update_body,
+            &mut sparse_section,
+        )
+        .unwrap();
+
+        let payload_len = (update_len + sparse_len) as u32;
+        let header = wire::PacketHeader::delta_snapshot(
+            schema_hash(&schema),
+            baseline.tick.raw() + 1,
+            baseline.tick.raw(),
+            payload_len,
+        );
+        let mut buf = vec![0u8; wire::HEADER_SIZE + payload_len as usize];
+        wire::encode_header(&header, &mut buf[..wire::HEADER_SIZE]).unwrap();
+        buf[wire::HEADER_SIZE..wire::HEADER_SIZE + update_len]
+            .copy_from_slice(&update_section[..update_len]);
+        buf[wire::HEADER_SIZE + update_len..wire::HEADER_SIZE + update_len + sparse_len]
+            .copy_from_slice(&sparse_section[..sparse_len]);
+
+        let packet = wire::decode_packet(&buf, &wire::Limits::for_testing()).unwrap();
+        let err = decode_delta_packet(&schema, &packet, &CodecLimits::for_testing()).unwrap_err();
+        assert!(matches!(err, CodecError::DuplicateUpdateEncoding));
+
+        let err = apply_delta_snapshot_from_packet(
+            &schema,
+            &baseline,
+            &packet,
+            &CodecLimits::for_testing(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CodecError::DuplicateUpdateEncoding));
     }
 
     #[test]

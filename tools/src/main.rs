@@ -206,11 +206,33 @@ fn print_inspect_report(report: &tools::InspectReport) {
     println!("sections:");
     for section in &report.sections {
         let tag = format!("{:?}", section.tag);
+        let label = match section.tag {
+            wire::SectionTag::EntityUpdateSparse => "entries",
+            _ => "entities",
+        };
         let count = section
             .entity_count
-            .map(|count| format!("{count} entities"))
+            .map(|count| format!("{count} {label}"))
             .unwrap_or_else(|| "count n/a".to_string());
         println!("  {tag}: {count} ({} bytes)", section.byte_len);
+    }
+    let update_encoding = if report
+        .sections
+        .iter()
+        .any(|section| section.tag == wire::SectionTag::EntityUpdateSparse)
+    {
+        Some("sparse")
+    } else if report
+        .sections
+        .iter()
+        .any(|section| section.tag == wire::SectionTag::EntityUpdate)
+    {
+        Some("masked")
+    } else {
+        None
+    };
+    if let Some(encoding) = update_encoding {
+        println!("update encoding: {encoding}");
     }
     if let Some(summary) = &report.update_summary {
         println!("update summary:");

@@ -4,7 +4,7 @@ use crate::error::{DecodeError, EncodeError, LimitKind, SectionFramingError, Wir
 use crate::header::{PacketFlags, PacketHeader, HEADER_SIZE, MAGIC, VERSION};
 use crate::limits::Limits;
 
-/// Section tags for version 0.
+/// Section tags for version 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 #[repr(u8)]
@@ -12,6 +12,7 @@ pub enum SectionTag {
     EntityCreate = 1,
     EntityDestroy = 2,
     EntityUpdate = 3,
+    EntityUpdateSparse = 4,
 }
 
 impl SectionTag {
@@ -21,6 +22,7 @@ impl SectionTag {
             1 => Ok(Self::EntityCreate),
             2 => Ok(Self::EntityDestroy),
             3 => Ok(Self::EntityUpdate),
+            4 => Ok(Self::EntityUpdateSparse),
             _ => Err(DecodeError::UnknownSectionTag { tag }),
         }
     }
@@ -334,6 +336,19 @@ mod tests {
         let limits = Limits::for_testing();
         let err = decode_packet(&buf, &limits).unwrap_err();
         assert!(matches!(err, DecodeError::InvalidFlags { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_version() {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        let version = 0u16;
+        buf[4..6].copy_from_slice(&version.to_le_bytes());
+        let flags = PacketFlags::full_snapshot().raw();
+        buf[6..8].copy_from_slice(&flags.to_le_bytes());
+        let limits = Limits::for_testing();
+        let err = decode_packet(&buf, &limits).unwrap_err();
+        assert!(matches!(err, DecodeError::UnsupportedVersion { found: 0 }));
     }
 
     #[test]

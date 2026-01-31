@@ -92,6 +92,7 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 - Apply deltas to a baseline to reconstruct a new snapshot.
 - Baseline history store (ring buffer) and baseline selection helpers.
 - Change detection and per-field/per-component masks.
+- Dual update encodings (masked vs sparse) with encoder-side selection.
 
 **Key types**
 - `SnapshotTick` (u32)
