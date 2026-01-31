@@ -54,6 +54,23 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+  demo-sim:
+    name: Demo Simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run demo simulation
+        run: |
+          cargo run -p demo-sim -- \
+            --players 16 \
+            --ticks 300 \
+            --seed 1 \
+            --out-dir target/demo-captures \
+            --max-p95-delta-bytes 8192 \
+            --max-avg-delta-bytes 4096
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

@@ -1,0 +1,17 @@
+[package]
+name = "demo-schema"
+description = "Reference schema and state types for sdec demo"
+publish = false
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "demo_schema"
+
+[dependencies]
+codec.workspace = true
+schema = { workspace = true, features = ["serde"] }

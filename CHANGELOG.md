@@ -41,3 +41,10 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.5.0] - 2026-01-31
+
+### Added
+- `demo-schema` and `demo-sim` reference crates for deterministic captures.
+- Capture output (`schema.json`, `full_*.bin`, `delta_*.bin`, `summary.json`).
+- CI demo simulation run with size budget checks.
+

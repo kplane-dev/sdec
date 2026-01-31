@@ -121,6 +121,13 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 - Loss/reorder simulation to verify resync behavior.
 - Benchmark output in JSON/CSV for CI regression checks.
 
+### `demo-schema/` and `demo-sim/`
+**Responsibility:** reference demo schema + deterministic capture generator.
+
+- `demo-schema` defines a small FPS-ish schema and state representation.
+- `demo-sim` runs a deterministic simulation and emits captures + `summary.json`.
+- Used in CI to catch regressions in packet sizes and correctness.
+
 ---
 
 ## Public API Principles
