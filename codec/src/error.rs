@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use schema::{ComponentId, FieldId};
+
 /// Result type for codec operations.
 pub type CodecResult<T> = Result<T, CodecError>;
 
@@ -10,6 +12,47 @@ pub type CodecResult<T> = Result<T, CodecError>;
 pub enum CodecError {
     /// Wire format error.
     Wire(wire::DecodeError),
+
+    /// Bitstream error.
+    Bitstream(bitstream::BitError),
+
+    /// Output buffer is too small.
+    OutputTooSmall { needed: usize, available: usize },
+
+    /// Schema hash mismatch.
+    SchemaMismatch { expected: u64, found: u64 },
+
+    /// Limits exceeded.
+    LimitsExceeded {
+        kind: LimitKind,
+        limit: usize,
+        actual: usize,
+    },
+
+    /// Invalid mask data.
+    InvalidMask { kind: MaskKind, reason: MaskReason },
+
+    /// Invalid field value for the schema.
+    InvalidValue {
+        component: ComponentId,
+        field: FieldId,
+        reason: ValueReason,
+    },
+
+    /// Entities are not provided in deterministic order.
+    InvalidEntityOrder { previous: u32, current: u32 },
+
+    /// Section body had trailing bits after parsing.
+    TrailingSectionData {
+        section: wire::SectionTag,
+        remaining_bits: usize,
+    },
+
+    /// Unexpected section for the current packet type.
+    UnexpectedSection { section: wire::SectionTag },
+
+    /// Duplicate section encountered.
+    DuplicateSection { section: wire::SectionTag },
 
     /// Baseline tick not found in history.
     BaselineNotFound {
@@ -44,10 +87,108 @@ pub enum CodecError {
     },
 }
 
+/// Specific limit that was exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKind {
+    EntitiesCreate,
+    ComponentsPerEntity,
+    FieldsPerComponent,
+    SectionBytes,
+}
+
+/// Mask validation error kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskKind {
+    ComponentMask,
+    FieldMask { component: ComponentId },
+}
+
+/// Details for invalid mask errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskReason {
+    NotEnoughBits { expected: usize, available: usize },
+    FieldCountMismatch { expected: usize, actual: usize },
+    MissingField { field: FieldId },
+    UnknownComponent { component: ComponentId },
+}
+
+/// Details for invalid value errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueReason {
+    UnsignedOutOfRange {
+        bits: u8,
+        value: u64,
+    },
+    SignedOutOfRange {
+        bits: u8,
+        value: i64,
+    },
+    VarUIntOutOfRange {
+        value: u64,
+    },
+    VarSIntOutOfRange {
+        value: i64,
+    },
+    FixedPointOutOfRange {
+        min_q: i64,
+        max_q: i64,
+        value: i64,
+    },
+    TypeMismatch {
+        expected: &'static str,
+        found: &'static str,
+    },
+}
+
 impl fmt::Display for CodecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Wire(e) => write!(f, "wire error: {e}"),
+            Self::Bitstream(e) => write!(f, "bitstream error: {e}"),
+            Self::OutputTooSmall { needed, available } => {
+                write!(f, "output too small: need {needed}, have {available}")
+            }
+            Self::SchemaMismatch { expected, found } => {
+                write!(
+                    f,
+                    "schema hash mismatch: expected 0x{expected:016X}, found 0x{found:016X}"
+                )
+            }
+            Self::LimitsExceeded {
+                kind,
+                limit,
+                actual,
+            } => {
+                write!(f, "{kind} limit exceeded: {actual} > {limit}")
+            }
+            Self::InvalidMask { kind, reason } => {
+                write!(f, "invalid {kind}: {reason}")
+            }
+            Self::InvalidValue {
+                component,
+                field,
+                reason,
+            } => {
+                write!(f, "invalid value for {component:?}:{field:?}: {reason}")
+            }
+            Self::InvalidEntityOrder { previous, current } => {
+                write!(f, "entity order invalid: {previous} then {current}")
+            }
+            Self::TrailingSectionData {
+                section,
+                remaining_bits,
+            } => {
+                write!(
+                    f,
+                    "trailing data in section {section:?}: {remaining_bits} bits"
+                )
+            }
+            Self::UnexpectedSection { section } => {
+                write!(f, "unexpected section {section:?} in full snapshot")
+            }
+            Self::DuplicateSection { section } => {
+                write!(f, "duplicate section {section:?} in packet")
+            }
             Self::BaselineNotFound { requested_tick } => {
                 write!(f, "baseline tick {requested_tick} not found in history")
             }
@@ -73,10 +214,83 @@ impl fmt::Display for CodecError {
     }
 }
 
+impl fmt::Display for LimitKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::EntitiesCreate => "entities",
+            Self::ComponentsPerEntity => "components per entity",
+            Self::FieldsPerComponent => "fields per component",
+            Self::SectionBytes => "section bytes",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl fmt::Display for MaskKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ComponentMask => write!(f, "component mask"),
+            Self::FieldMask { component } => write!(f, "field mask for {component:?}"),
+        }
+    }
+}
+
+impl fmt::Display for MaskReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotEnoughBits {
+                expected,
+                available,
+            } => {
+                write!(f, "need {expected} bits, have {available}")
+            }
+            Self::FieldCountMismatch { expected, actual } => {
+                write!(f, "expected {expected} fields, got {actual}")
+            }
+            Self::MissingField { field } => {
+                write!(f, "missing field {field:?} in full snapshot")
+            }
+            Self::UnknownComponent { component } => {
+                write!(f, "unknown component {component:?} in snapshot")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ValueReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsignedOutOfRange { bits, value } => {
+                write!(f, "unsigned value {value} does not fit in {bits} bits")
+            }
+            Self::SignedOutOfRange { bits, value } => {
+                write!(f, "signed value {value} does not fit in {bits} bits")
+            }
+            Self::VarUIntOutOfRange { value } => {
+                write!(f, "varuint value {value} exceeds u32::MAX")
+            }
+            Self::VarSIntOutOfRange { value } => {
+                write!(f, "varsint value {value} exceeds i32 range")
+            }
+            Self::FixedPointOutOfRange {
+                min_q,
+                max_q,
+                value,
+            } => {
+                write!(f, "fixed-point value {value} outside [{min_q}, {max_q}]")
+            }
+            Self::TypeMismatch { expected, found } => {
+                write!(f, "expected {expected} but got {found}")
+            }
+        }
+    }
+}
+
 impl std::error::Error for CodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Wire(e) => Some(e),
+            Self::Bitstream(e) => Some(e),
             _ => None,
         }
     }
@@ -85,6 +299,12 @@ impl std::error::Error for CodecError {
 impl From<wire::DecodeError> for CodecError {
     fn from(err: wire::DecodeError) -> Self {
         Self::Wire(err)
+    }
+}
+
+impl From<bitstream::BitError> for CodecError {
+    fn from(err: bitstream::BitError) -> Self {
+        Self::Bitstream(err)
     }
 }
 
@@ -139,6 +359,16 @@ mod tests {
         let wire_err = wire::DecodeError::InvalidMagic { found: 0x1234 };
         let codec_err: CodecError = wire_err.into();
         assert!(matches!(codec_err, CodecError::Wire(_)));
+    }
+
+    #[test]
+    fn error_from_bitstream_error() {
+        let bit_err = bitstream::BitError::UnexpectedEof {
+            requested: 1,
+            available: 0,
+        };
+        let codec_err: CodecError = bit_err.into();
+        assert!(matches!(codec_err, CodecError::Bitstream(_)));
     }
 
     #[test]

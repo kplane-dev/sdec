@@ -18,11 +18,18 @@
 //! - **Deterministic** - Same inputs produce same outputs.
 
 mod error;
+mod limits;
+mod snapshot;
 mod types;
 
-pub use error::{CodecError, CodecResult};
+pub use error::{CodecError, CodecResult, LimitKind, MaskKind, MaskReason, ValueReason};
+pub use limits::CodecLimits;
+pub use snapshot::{
+    decode_full_snapshot, decode_full_snapshot_from_packet, encode_full_snapshot,
+    ComponentSnapshot, EntitySnapshot, FieldValue, Snapshot,
+};
 pub use types::{EntityId, SnapshotTick};
-pub use wire::Limits;
+pub use wire::Limits as WireLimits;
 
 #[cfg(test)]
 mod tests {
@@ -33,7 +40,8 @@ mod tests {
         // Verify all expected items are exported
         let _ = SnapshotTick::new(0);
         let _ = EntityId::new(0);
-        let _ = Limits::default();
+        let _ = WireLimits::default();
+        let _ = CodecLimits::default();
 
         // Error types
         let _: CodecResult<()> = Ok(());
@@ -55,7 +63,7 @@ mod tests {
     #[test]
     fn limits_reexported() {
         // Limits is re-exported from wire
-        let limits = Limits::default();
+        let limits = WireLimits::default();
         assert!(limits.max_packet_bytes > 0);
     }
 }
