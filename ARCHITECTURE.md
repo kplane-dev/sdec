@@ -48,6 +48,7 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 
 - `BitWriter`: write bits, aligned ints, varints.
 - `BitReader`: bounded reads, exact error reporting.
+- Primary API is bounded (writes into `&mut [u8]`); `BitVecWriter` is a convenience wrapper.
 - Utilities for fixed-point quantization encoding.
 - **No domain knowledge** (no entities/components).
 

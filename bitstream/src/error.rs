@@ -9,7 +9,7 @@ pub type BitResult<T> = Result<T, BitError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitError {
     /// Attempted to read past the end of the buffer.
-    EndOfBuffer {
+    UnexpectedEof {
         /// Number of bits requested.
         requested: usize,
         /// Number of bits available.
@@ -17,22 +17,19 @@ pub enum BitError {
     },
 
     /// Attempted to write more bits than the buffer can hold.
-    ///
-    /// Note: This error is reserved for future bounded-capacity writer modes.
-    /// The current `BitWriter` uses a growable `Vec` and will not return this error.
-    BufferOverflow {
+    WriteOverflow {
         /// Number of bits attempted to write.
         attempted: usize,
-        /// Maximum capacity in bits.
-        capacity: usize,
+        /// Number of bits available.
+        available: usize,
     },
 
     /// Invalid bit count for the operation.
     InvalidBitCount {
         /// The invalid bit count provided.
-        bits: usize,
+        bits: u8,
         /// Maximum allowed bits for this operation.
-        max_bits: usize,
+        max_bits: u8,
     },
 
     /// Value exceeds the range representable by the specified number of bits.
@@ -40,29 +37,38 @@ pub enum BitError {
         /// The value that was out of range.
         value: u64,
         /// Number of bits available.
-        bits: usize,
+        bits: u8,
+    },
+
+    /// Invalid varint encoding (too many bytes or overflow).
+    InvalidVarint,
+
+    /// Attempted to read or write a byte-aligned value when not aligned.
+    MisalignedAccess {
+        /// Current bit position.
+        bit_position: usize,
     },
 }
 
 impl fmt::Display for BitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EndOfBuffer {
+            Self::UnexpectedEof {
                 requested,
                 available,
             } => {
                 write!(
                     f,
-                    "attempted to read {requested} bits but only {available} bits available"
+                    "unexpected EOF: requested {requested} bits, {available} available"
                 )
             }
-            Self::BufferOverflow {
+            Self::WriteOverflow {
                 attempted,
-                capacity,
+                available,
             } => {
                 write!(
                     f,
-                    "attempted to write {attempted} bits but buffer capacity is {capacity} bits"
+                    "write overflow: attempted {attempted} bits, {available} available"
                 )
             }
             Self::InvalidBitCount { bits, max_bits } => {
@@ -70,6 +76,12 @@ impl fmt::Display for BitError {
             }
             Self::ValueOutOfRange { value, bits } => {
                 write!(f, "value {value} cannot be represented in {bits} bits")
+            }
+            Self::InvalidVarint => {
+                write!(f, "invalid varint encoding")
+            }
+            Self::MisalignedAccess { bit_position } => {
+                write!(f, "misaligned access at bit position {bit_position}")
             }
         }
     }
@@ -82,27 +94,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_display_end_of_buffer() {
-        let err = BitError::EndOfBuffer {
+    fn error_display_unexpected_eof() {
+        let err = BitError::UnexpectedEof {
             requested: 8,
             available: 3,
         };
         let msg = err.to_string();
-        assert!(msg.contains("8 bits"), "should mention requested bits");
-        assert!(msg.contains("3 bits"), "should mention available bits");
-        assert!(msg.contains("read"), "should mention read operation");
+        assert!(msg.contains("8"), "should mention requested bits");
+        assert!(msg.contains("3"), "should mention available bits");
+        assert!(msg.contains("EOF"), "should mention EOF");
     }
 
     #[test]
-    fn error_display_buffer_overflow() {
-        let err = BitError::BufferOverflow {
+    fn error_display_write_overflow() {
+        let err = BitError::WriteOverflow {
             attempted: 100,
-            capacity: 64,
+            available: 64,
         };
         let msg = err.to_string();
         assert!(msg.contains("100"), "should mention attempted bits");
-        assert!(msg.contains("64"), "should mention capacity");
-        assert!(msg.contains("write"), "should mention write operation");
+        assert!(msg.contains("64"), "should mention available bits");
+        assert!(msg.contains("overflow"), "should mention overflow");
     }
 
     #[test]
@@ -124,20 +136,34 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("256"), "should mention the value");
-        assert!(msg.contains("8 bits"), "should mention bit count");
+        assert!(msg.contains("8"), "should mention bit count");
+    }
+
+    #[test]
+    fn error_display_invalid_varint() {
+        let err = BitError::InvalidVarint;
+        assert!(err.to_string().contains("varint"));
+    }
+
+    #[test]
+    fn error_display_misaligned_access() {
+        let err = BitError::MisalignedAccess { bit_position: 3 };
+        let msg = err.to_string();
+        assert!(msg.contains("3"), "should mention bit position");
+        assert!(msg.contains("misaligned"));
     }
 
     #[test]
     fn error_equality() {
-        let err1 = BitError::EndOfBuffer {
+        let err1 = BitError::UnexpectedEof {
             requested: 8,
             available: 3,
         };
-        let err2 = BitError::EndOfBuffer {
+        let err2 = BitError::UnexpectedEof {
             requested: 8,
             available: 3,
         };
-        let err3 = BitError::EndOfBuffer {
+        let err3 = BitError::UnexpectedEof {
             requested: 8,
             available: 4,
         };
@@ -157,12 +183,12 @@ mod tests {
 
     #[test]
     fn error_debug() {
-        let err = BitError::EndOfBuffer {
+        let err = BitError::UnexpectedEof {
             requested: 1,
             available: 0,
         };
         let debug = format!("{err:?}");
-        assert!(debug.contains("EndOfBuffer"));
+        assert!(debug.contains("UnexpectedEof"));
     }
 
     #[test]

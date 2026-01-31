@@ -1,0 +1,18 @@
+[package]
+name = "sdec-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bitstream = { path = "../bitstream", package = "sdec-bitstream" }
+
+[[bin]]
+name = "bitreader"
+path = "fuzz_targets/bitreader.rs"
+test = false
+doc = false
