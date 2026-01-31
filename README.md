@@ -103,6 +103,13 @@ cargo run -p demo-sim -- --players 16 --ticks 300 --seed 1 --out-dir captures
 
 This writes `schema.json`, `full_*.bin`, `delta_*.bin`, and `summary.json` to the output directory.
 
+## Simbench Harness
+
+Run a deterministic benchmark and emit `summary.json`:
+
+```bash
+cargo run -p simbench -- --players 16 --ticks 300 --seed 1 --out-dir target/simbench
+```
 ## Building
 
 ```bash
