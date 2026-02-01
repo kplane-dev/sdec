@@ -10,9 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 bitstream = { path = "../bitstream", package = "sdec-bitstream" }
+codec = { path = "../codec", package = "sdec-codec" }
+schema = { path = "../schema", package = "sdec-schema" }
+wire = { path = "../wire", package = "sdec-wire" }
 
 [[bin]]
 name = "bitreader"
 path = "fuzz_targets/bitreader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "session_packet"
+path = "fuzz_targets/session_packet.rs"
 test = false
 doc = false
