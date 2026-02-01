@@ -31,8 +31,6 @@ The codec is **bytes in / bytes out**. It does not open sockets, manage connecti
 ---
 
 ## Non-Goals (for now)
-
-- Interest management (relevancy sets). Caller provides the list of entities/components to replicate.
 - Client prediction / server reconciliation / lag compensation.
 - Encryption, authentication, NAT traversal, matchmaking.
 - A full "network framework" (channels, reliability, resend). Transport layer is external.
@@ -114,6 +112,13 @@ This is a single git repo using a Rust workspace. Split into crates to keep boun
 **Notes**
 - Tooling is a major adoption lever—treat it as a first-class product.
 - Tools reuse codec decode helpers (e.g., `decode_delta_packet`) rather than re-implementing parsing.
+
+### `repgraph/`
+**Responsibility:** replication graph and interest management.
+
+- Per-client relevance filtering and change list generation.
+- Produces `creates/destroys/updates` for `codec::encode_delta_from_changes`.
+- No transport or ECS dependency; caller supplies world data via callbacks.
 
 ### `simbench/`
 **Responsibility:** reproducible scenarios for size/perf/robustness.

@@ -14,6 +14,9 @@
 - **Correctness first** — Bounded decoding, no panics, explicit error handling
 - **Engine agnostic** — Bytes in, bytes out. No assumptions about ECS or networking stack
 
+For interest management and per-client change lists, use the `sdec-repgraph` crate. It decides
+what gets encoded and feeds directly into `codec::encode_delta_from_changes`.
+
 ## Status
 
 🚧 **Work in Progress** — Currently implementing the initial core release (codec + stable wire format).
@@ -34,6 +37,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](W
 | `wire` | Wire format: packet headers, section framing, limits |
 | `schema` | Replication schema model and field codecs |
 | `codec` | Snapshot/delta encoding and decoding |
+| `repgraph` | Replication graph + interest management |
 | `tools` | Introspection and debugging utilities |
 | `simbench` | Scenario generation and benchmarking |
 
@@ -143,7 +147,6 @@ cargo fmt --all
 ## Non-Goals (for now)
 
 - Transport layer (UDP, QUIC, etc.)
-- Interest management / relevancy filtering
 - Client prediction / server reconciliation
 - Encryption / authentication
 
