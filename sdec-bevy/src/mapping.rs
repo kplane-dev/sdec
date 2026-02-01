@@ -39,6 +39,11 @@ impl EntityMap {
         self.to_entity.get(&id).copied()
     }
 
+    #[must_use]
+    pub fn ids(&self) -> Vec<EntityId> {
+        self.to_entity.keys().copied().collect()
+    }
+
     pub fn register(&mut self, id: EntityId, entity: Entity) {
         self.to_id.insert(entity, id);
         self.to_entity.insert(id, entity);
