@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use bitstream::BitVecWriter;
 use clap::{Parser, ValueEnum};
 use codec::{
-    encode_delta_snapshot_for_client_session_with_scratch, encode_delta_snapshot_from_updates,
+    encode_delta_from_changes, encode_delta_snapshot_for_client_session_with_scratch,
     encode_delta_snapshot_with_scratch, encode_full_snapshot, CodecLimits, CodecScratch,
-    DeltaUpdateComponent, DeltaUpdateEntity,
+    DeltaUpdateComponent, DeltaUpdateEntity, SessionEncoder,
 };
 use serde::Serialize;
 use wire::Limits as WireLimits;
@@ -92,6 +92,7 @@ fn main() -> Result<()> {
     let schema = demo_schema(cli.threshold_q);
     let limits = CodecLimits::default();
     let wire_limits = WireLimits::default();
+    let mut dirty_session = SessionEncoder::new(&schema, &limits);
 
     fs::create_dir_all(&cli.out_dir)
         .with_context(|| format!("create output dir {}", cli.out_dir.display()))?;
@@ -151,12 +152,11 @@ fn main() -> Result<()> {
             sdec.add_with_tick(delta_bytes.len() as u64, sdec_us, tick);
             let dirty_updates = build_dirty_updates(&schema, &baseline_snapshot, &snapshot)?;
             let dirty_start = Instant::now();
-            let dirty_bytes = encode_delta_from_updates(
-                &schema,
+            let dirty_bytes = encode_dirty_delta(
+                &mut dirty_session,
                 snapshot.tick,
                 baseline_snapshot.tick,
                 &dirty_updates,
-                &limits,
             )?;
             let dirty_elapsed = dirty_start.elapsed();
             let dirty_us = dirty_elapsed.as_micros() as u64;
@@ -280,25 +280,17 @@ fn encode_delta_with_scratch(
     Ok(buf)
 }
 
-fn encode_delta_from_updates(
-    schema: &schema::Schema,
+fn encode_dirty_delta(
+    session: &mut SessionEncoder<'_>,
     tick: codec::SnapshotTick,
     baseline_tick: codec::SnapshotTick,
     updates: &[DeltaUpdateEntity],
-    limits: &CodecLimits,
 ) -> Result<Vec<u8>> {
+    let limits = session.limits();
     let mut buf = vec![0u8; limits.max_section_bytes.max(wire::HEADER_SIZE) * 4];
-    let bytes = encode_delta_snapshot_from_updates(
-        schema,
-        tick,
-        baseline_tick,
-        &[],
-        &[],
-        updates,
-        limits,
-        &mut buf,
-    )
-    .context("encode delta from updates")?;
+    let bytes =
+        encode_delta_from_changes(session, tick, baseline_tick, &[], &[], updates, &mut buf)
+            .context("encode delta from updates")?;
     buf.truncate(bytes);
     Ok(buf)
 }

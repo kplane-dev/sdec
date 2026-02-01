@@ -28,6 +28,8 @@ pub fn select_baseline_tick<T>(
 
 /// Encodes a delta snapshot into the provided output buffer.
 ///
+/// This is the scan-based path and is kept as a convenience/fallback. For
+/// production engines with dirty/change lists, prefer `encode_delta_from_changes`.
 /// Baseline and current snapshots must have entities sorted by `EntityId`.
 pub fn encode_delta_snapshot(
     schema: &schema::Schema,
@@ -102,10 +104,67 @@ pub fn encode_delta_snapshot_for_client(
     )
 }
 
+/// Encoder context for delta packets that use caller-provided change lists.
+///
+/// This avoids scanning baseline/current snapshots and is preferred for
+/// production engines that already track dirty state.
+pub struct SessionEncoder<'a> {
+    schema: &'a schema::Schema,
+    limits: &'a CodecLimits,
+    #[allow(dead_code)]
+    scratch: CodecScratch,
+}
+
+impl<'a> SessionEncoder<'a> {
+    #[must_use]
+    pub fn new(schema: &'a schema::Schema, limits: &'a CodecLimits) -> Self {
+        Self {
+            schema,
+            limits,
+            scratch: CodecScratch::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn schema(&self) -> &'a schema::Schema {
+        self.schema
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> &'a CodecLimits {
+        self.limits
+    }
+}
+
+/// Encodes a delta snapshot from precomputed change lists.
+///
+/// Preferred for production engines (dirty/change-list driven). The scan-based
+/// encode paths remain as a convenience/fallback.
+pub fn encode_delta_from_changes(
+    session: &mut SessionEncoder<'_>,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    creates: &[EntitySnapshot],
+    destroys: &[EntityId],
+    updates: &[DeltaUpdateEntity],
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    encode_delta_snapshot_from_updates(
+        session.schema,
+        tick,
+        baseline_tick,
+        destroys,
+        creates,
+        updates,
+        session.limits,
+        out,
+    )
+}
+
 /// Encodes a delta snapshot using precomputed change lists.
 ///
-/// This avoids scanning baseline/current snapshots by accepting explicit
-/// create/destroy/update lists (typically derived from engine dirty tracking).
+/// This is a lower-level helper. Prefer `encode_delta_from_changes` with a
+/// `SessionEncoder` for production use.
 pub fn encode_delta_snapshot_from_updates(
     schema: &schema::Schema,
     tick: SnapshotTick,
