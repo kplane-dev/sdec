@@ -40,7 +40,7 @@ pub fn extract_changes(
         }
     }
 
-    let mut creates = Vec::new();
+    let mut creates = Vec::with_capacity(create_entities.len());
     for entity in create_entities.iter().copied() {
         let id = entities.entity_id(entity);
         let components = schema.snapshot_entity(world, entity);
@@ -50,13 +50,13 @@ pub fn extract_changes(
         creates.push(EntitySnapshot { id, components });
     }
 
-    let mut updates = Vec::new();
+    let mut updates = Vec::with_capacity(update_entities.len());
     for (entity, components) in update_entities {
         if create_entities.contains(&entity) {
             continue;
         }
         let id = entities.entity_id(entity);
-        let mut delta_components = Vec::new();
+        let mut delta_components = Vec::with_capacity(components.len());
         for adapter in schema.adapters() {
             if !components.contains(&adapter.component_id()) {
                 continue;
@@ -73,7 +73,8 @@ pub fn extract_changes(
         }
     }
 
-    let mut destroys_vec: Vec<EntityId> = destroys.into_iter().collect();
+    let mut destroys_vec: Vec<EntityId> = Vec::with_capacity(destroys.len());
+    destroys_vec.extend(destroys);
     destroys_vec.sort_by_key(|id| id.raw());
 
     creates.sort_by_key(|entity| entity.id.raw());

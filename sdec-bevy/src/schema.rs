@@ -228,7 +228,7 @@ impl BevySchema {
         entity_id: codec::EntityId,
         component_ids: &[ComponentId],
     ) -> Option<DeltaUpdateEntity> {
-        let mut components = Vec::new();
+        let mut components = Vec::with_capacity(component_ids.len());
         for component_id in component_ids {
             let adapter = self.adapter_by_component(*component_id)?;
             if let Some(update) = adapter.update_component(world, entity) {
