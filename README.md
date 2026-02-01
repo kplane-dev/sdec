@@ -19,7 +19,14 @@ what gets encoded and feeds directly into `codec::encode_delta_from_changes`.
 
 ## Status
 
-🚧 **Work in Progress** — Currently implementing the initial core release (codec + stable wire format).
+🚧 **Work in Progress** — Core protocol is stable; sessions/compact headers and repgraph
+integration are active, and public APIs are still evolving.
+
+## Initial Results (Simbench)
+
+- Global delta size (dense): 259B avg, 266B p95 (vs 268B/282B naive).
+- Per-client visibility: ~21B avg per client (naive list ~17B, full bincode ~65B).
+- Dirty-list encode (dense): ~2x faster (97us → 47us avg).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](WIRE_FORMAT.md) for the binary protocol specification.
 

@@ -14,7 +14,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kplane-dev/sdec"
@@ -36,12 +36,12 @@ missing_panics_doc = "allow"
 
 [workspace.dependencies]
 # Internal crates
-bitstream = { path = "bitstream", version = "0.6.1", package = "sdec-bitstream" }
-wire = { path = "wire", version = "0.6.1", package = "sdec-wire" }
-schema = { path = "schema", version = "0.6.1", package = "sdec-schema" }
-codec = { path = "codec", version = "0.6.1", package = "sdec-codec" }
-repgraph = { path = "repgraph", version = "0.6.1", package = "sdec-repgraph" }
-tools = { path = "tools", version = "0.6.1" }
+bitstream = { path = "bitstream", version = "0.7.0", package = "sdec-bitstream" }
+wire = { path = "wire", version = "0.7.0", package = "sdec-wire" }
+schema = { path = "schema", version = "0.7.0", package = "sdec-schema" }
+codec = { path = "codec", version = "0.7.0", package = "sdec-codec" }
+repgraph = { path = "repgraph", version = "0.7.0", package = "sdec-repgraph" }
+tools = { path = "tools", version = "0.7.0" }
 
 # Testing
 proptest = "1.4"

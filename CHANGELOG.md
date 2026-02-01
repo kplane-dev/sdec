@@ -41,6 +41,16 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.7.0] - 2026-01-31
+
+### Added
+- `sdec-repgraph` for interest management and change lists.
+- Dirty-list encoder API (`encode_delta_from_changes`).
+- Session fuzz target + chaos tests, plus CI fuzz smoke run.
+
+### Changed
+- Bump workspace and internal crate versions to 0.7.0.
+
 ## [0.6.1] - 2026-01-31
 
 ### Added
