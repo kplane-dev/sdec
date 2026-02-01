@@ -207,6 +207,19 @@ impl BevySchema {
             .ok_or_else(|| anyhow!("unknown component {:?}", component_id))?;
         adapter.apply_update(world, entity, fields)
     }
+
+    pub fn insert_component_fields(
+        &self,
+        world: &mut World,
+        entity: Entity,
+        component_id: ComponentId,
+        fields: &[FieldValue],
+    ) -> Result<()> {
+        let adapter = self
+            .adapter_by_component(component_id)
+            .ok_or_else(|| anyhow!("unknown component {:?}", component_id))?;
+        adapter.insert_component(world, entity, fields)
+    }
 }
 
 #[derive(Default)]

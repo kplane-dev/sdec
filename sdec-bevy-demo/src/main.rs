@@ -246,13 +246,24 @@ fn main() -> Result<()> {
     let mut apply_times = Vec::new();
     let mut errors = 0u64;
 
-    let sdec_limits = codec::CodecLimits::default();
+    let mut sdec_limits = codec::CodecLimits::default();
+    let entity_count = cli.entities as usize;
+    sdec_limits.max_section_bytes = 16 * 1024 * 1024;
+    sdec_limits.max_entities_create = sdec_limits.max_entities_create.max(entity_count);
+    sdec_limits.max_entities_destroy = sdec_limits.max_entities_destroy.max(entity_count);
+    sdec_limits.max_entities_update = sdec_limits.max_entities_update.max(entity_count * 2);
+    sdec_limits.max_total_entities_after_apply = sdec_limits
+        .max_total_entities_after_apply
+        .max(entity_count * 2);
+    let full_buf_size = (entity_count.saturating_mul(1024)).max(16 * 1024 * 1024);
+    let delta_buf_size = (entity_count.saturating_mul(512)).max(4 * 1024 * 1024);
     let mut sdec_encoder = codec::SessionEncoder::new(schema.schema(), &sdec_limits);
     let mut sdec_session_init_bytes = 0u64;
 
     if matches!(cli.mode, Mode::Sdec) {
         let mut init_buf = vec![0u8; 128];
         for (idx, client_state) in clients_state.iter_mut().enumerate() {
+            init_buf.resize(128, 0);
             let init_len = codec::encode_session_init_packet(
                 schema.schema(),
                 SnapshotTick::new(0),
@@ -261,10 +272,9 @@ fn main() -> Result<()> {
                 &sdec_limits,
                 &mut init_buf,
             )?;
-            init_buf.truncate(init_len);
             sdec_session_init_bytes += init_len as u64;
 
-            let init_packet = wire::decode_packet(&init_buf, &wire::Limits::default())
+            let init_packet = wire::decode_packet(&init_buf[..init_len], &wire::Limits::default())
                 .context("decode session init")?;
             let session =
                 codec::decode_session_init_packet(schema.schema(), &init_packet, &sdec_limits)
@@ -313,29 +323,25 @@ fn main() -> Result<()> {
                             &mut server_entities,
                             &visible_ids,
                         );
-                        let mut buf = vec![0u8; 64 * 1024];
-                        let len = codec::encode_full_snapshot(
+                        let buf = encode_full_snapshot_retry(
                             schema.schema(),
                             SnapshotTick::new(tick),
                             &snapshot,
                             &sdec_limits,
-                            &mut buf,
+                            full_buf_size,
                         )?;
-                        buf.truncate(len);
                         client_state.last_tick = SnapshotTick::new(tick);
                         buf
                     } else {
-                        let mut buf = vec![0u8; 16 * 1024];
-                        let len = codec::encode_delta_from_changes(
+                        let buf = encode_delta_retry(
                             &mut sdec_encoder,
                             SnapshotTick::new(tick),
                             SnapshotTick::new(tick.saturating_sub(1)),
                             &change_set.creates,
                             &change_set.destroys,
                             &change_set.updates,
-                            &mut buf,
+                            delta_buf_size,
                         )?;
-                        buf.truncate(len);
                         let payload = &buf[wire::HEADER_SIZE..];
                         let (compact, new_last_tick) = build_compact_packet(
                             wire::SessionFlags::delta_snapshot(),
@@ -599,6 +605,66 @@ fn apply_sdec_packet(
     Ok(())
 }
 
+fn encode_full_snapshot_retry(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    snapshot: &[codec::EntitySnapshot],
+    limits: &codec::CodecLimits,
+    start_size: usize,
+) -> Result<Vec<u8>> {
+    let mut size = start_size.max(1024);
+    for _ in 0..5 {
+        let mut buf = vec![0u8; size];
+        match codec::encode_full_snapshot(schema, tick, snapshot, limits, &mut buf) {
+            Ok(len) => {
+                buf.truncate(len);
+                return Ok(buf);
+            }
+            Err(codec::CodecError::OutputTooSmall { needed, .. }) => {
+                size = size.max(needed).saturating_mul(2);
+            }
+            Err(codec::CodecError::Bitstream(_)) => size = size.saturating_mul(2),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(anyhow::anyhow!("snapshot encode retry overflow"))
+}
+
+fn encode_delta_retry(
+    encoder: &mut codec::SessionEncoder<'_>,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    creates: &[codec::EntitySnapshot],
+    destroys: &[codec::EntityId],
+    updates: &[codec::DeltaUpdateEntity],
+    start_size: usize,
+) -> Result<Vec<u8>> {
+    let mut size = start_size.max(1024);
+    for _ in 0..5 {
+        let mut buf = vec![0u8; size];
+        match codec::encode_delta_from_changes(
+            encoder,
+            tick,
+            baseline_tick,
+            creates,
+            destroys,
+            updates,
+            &mut buf,
+        ) {
+            Ok(len) => {
+                buf.truncate(len);
+                return Ok(buf);
+            }
+            Err(codec::CodecError::OutputTooSmall { needed, .. }) => {
+                size = size.max(needed).saturating_mul(2);
+            }
+            Err(codec::CodecError::Bitstream(_)) => size = size.saturating_mul(2),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(anyhow::anyhow!("delta encode retry overflow"))
+}
+
 fn step_positions(world: &mut World, rng: &mut Rng, dirty_pct: f32) {
     let mut query = world.query::<&mut PositionYaw>();
     for mut pos in query.iter_mut(world) {
@@ -687,7 +753,12 @@ fn apply_full_snapshot(
         for component in &entity_snapshot.components {
             let fields: Vec<(usize, FieldValue)> =
                 component.fields.iter().copied().enumerate().collect();
-            schema.apply_component_fields(world, entity, component.id, &fields)?;
+            if schema
+                .apply_component_fields(world, entity, component.id, &fields)
+                .is_err()
+            {
+                schema.insert_component_fields(world, entity, component.id, &component.fields)?;
+            }
         }
         seen.insert(entity_snapshot.id);
     }
