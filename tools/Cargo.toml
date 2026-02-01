@@ -1,7 +1,6 @@
 [package]
-name = "tools"
+name = "sdec-tools"
 description = "Introspection and debugging tools for the sdec codec"
-publish = false
 readme = "../README.md"
 keywords = ["netcode", "tools", "snapshot", "delta", "debugging"]
 categories = ["network-programming", "game-development", "encoding"]
