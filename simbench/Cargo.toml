@@ -16,6 +16,7 @@ bitstream.workspace = true
 wire.workspace = true
 schema.workspace = true
 codec.workspace = true
+repgraph.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5.2", features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }

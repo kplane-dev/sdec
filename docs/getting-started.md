@@ -40,6 +40,19 @@ Use session mode when:
    - Use packed sparse indices for updates.
    - Encode against the last ACKed baseline for that client.
 
+### Using `sdec-repgraph` for per-client deltas
+
+The `sdec-repgraph` crate handles interest management and emits
+`creates/destroys/updates` that feed directly into
+`codec::encode_delta_from_changes`.
+
+Typical flow per tick:
+
+1) Update entity positions + dirty components in the `ReplicationGraph`.
+2) For each client, call `build_client_delta(...)`.
+3) Encode the delta with `encode_delta_from_changes`.
+4) After all clients are processed, call `clear_dirty()` and `clear_removed()`.
+
 5) **Track ACKs** per client:
    - ACKs advance the baseline tick.
    - Missing ACKs mean you must fall back to full snapshots or re-init.

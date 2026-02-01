@@ -6,10 +6,10 @@ use anyhow::{Context, Result};
 use bitstream::BitVecWriter;
 use clap::{Parser, ValueEnum};
 use codec::{
-    encode_delta_from_changes, encode_delta_snapshot_for_client_session_with_scratch,
-    encode_delta_snapshot_with_scratch, encode_full_snapshot, CodecLimits, CodecScratch,
-    DeltaUpdateComponent, DeltaUpdateEntity, SessionEncoder,
+    encode_delta_from_changes, encode_delta_snapshot_with_scratch, encode_full_snapshot,
+    CodecLimits, CodecScratch, DeltaUpdateComponent, DeltaUpdateEntity, SessionEncoder,
 };
+use repgraph::{ClientId, ClientView, ReplicationConfig, ReplicationGraph, Vec3, WorldView};
 use serde::Serialize;
 use wire::Limits as WireLimits;
 
@@ -93,6 +93,13 @@ fn main() -> Result<()> {
     let limits = CodecLimits::default();
     let wire_limits = WireLimits::default();
     let mut dirty_session = SessionEncoder::new(&schema, &limits);
+    let mut repgraph_session = SessionEncoder::new(&schema, &limits);
+    let mut repgraph = if cli.scenario == Scenario::Visibility {
+        Some(ReplicationGraph::new(ReplicationConfig::default_limits()))
+    } else {
+        None
+    };
+    let mut last_states: Option<Vec<DemoEntityState>> = None;
 
     fs::create_dir_all(&cli.out_dir)
         .with_context(|| format!("create output dir {}", cli.out_dir.display()))?;
@@ -125,7 +132,6 @@ fn main() -> Result<()> {
             None
         };
     let mut client_baselines: Vec<codec::Snapshot> = Vec::new();
-    let mut client_last_ticks: Vec<codec::SnapshotTick> = Vec::new();
 
     for tick in 1..=cli.ticks {
         step_states(&mut states, &mut rng, tick, &cli);
@@ -186,19 +192,41 @@ fn main() -> Result<()> {
                         entities: Vec::new(),
                     })
                     .collect();
-                client_last_ticks = vec![codec::SnapshotTick::new(0); cli.clients as usize];
             }
-            run_visibility(
-                &schema,
-                &states,
-                tick,
-                &mut client_baselines,
-                &mut client_last_ticks,
-                &mut scratch,
-                cli.visibility_radius_q,
-                per_client_stats.as_mut().expect("per-client stats"),
-                per_client_breakdown.as_mut(),
-            )?;
+            let dirty_mask = build_dirty_mask(last_states.as_deref(), &states);
+            if let Some(graph) = repgraph.as_mut() {
+                let dirty_component = component_id();
+                for (state, dirty) in states.iter().zip(dirty_mask.iter()) {
+                    let dirty_components: &[schema::ComponentId] = if *dirty {
+                        std::slice::from_ref(&dirty_component)
+                    } else {
+                        &[]
+                    };
+                    graph.update_entity(
+                        state.id,
+                        Vec3 {
+                            x: state.pos_q[0] as f32,
+                            y: state.pos_q[1] as f32,
+                            z: state.pos_q[2] as f32,
+                        },
+                        dirty_components,
+                    );
+                }
+                run_visibility(
+                    &schema,
+                    &states,
+                    tick,
+                    &mut client_baselines,
+                    graph,
+                    &mut repgraph_session,
+                    cli.visibility_radius_q,
+                    per_client_stats.as_mut().expect("per-client stats"),
+                    per_client_breakdown.as_mut(),
+                )?;
+                graph.clear_dirty();
+                graph.clear_removed();
+            }
+            last_states = Some(states.clone());
         }
 
         baseline_snapshot = snapshot;
@@ -295,31 +323,6 @@ fn encode_dirty_delta(
     Ok(buf)
 }
 
-fn encode_delta_for_client_with_scratch(
-    schema: &schema::Schema,
-    baseline: &codec::Snapshot,
-    current: &codec::Snapshot,
-    limits: &CodecLimits,
-    scratch: &mut CodecScratch,
-    last_tick: &mut codec::SnapshotTick,
-) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; limits.max_section_bytes.max(wire::HEADER_SIZE) * 4];
-    let bytes = encode_delta_snapshot_for_client_session_with_scratch(
-        schema,
-        current.tick,
-        baseline.tick,
-        baseline,
-        current,
-        limits,
-        scratch,
-        last_tick,
-        &mut buf,
-    )
-    .context("encode delta snapshot (client session)")?;
-    buf.truncate(bytes);
-    Ok(buf)
-}
-
 #[derive(Default, Debug)]
 struct ClientBreakdown {
     packets: u64,
@@ -357,64 +360,6 @@ impl ClientBreakdown {
             self.update_entities, self.update_components, self.update_fields
         );
     }
-}
-
-fn record_client_breakdown_session(
-    breakdown: &mut ClientBreakdown,
-    schema: &schema::Schema,
-    bytes: &[u8],
-    last_tick: u32,
-) -> Result<()> {
-    let header = wire::decode_session_header(bytes, last_tick).context("decode session header")?;
-    let payload_start = header.header_len;
-    let payload_end = payload_start + header.payload_len as usize;
-    if payload_end > bytes.len() {
-        anyhow::bail!("session payload length exceeds buffer");
-    }
-    let payload = &bytes[payload_start..payload_end];
-    let sections =
-        wire::decode_sections(payload, &WireLimits::default()).context("decode sections")?;
-
-    breakdown.packets += 1;
-    breakdown.packet_bytes += bytes.len() as u64;
-    for section in &sections {
-        match section.tag {
-            wire::SectionTag::EntityDestroy => breakdown.destroy_bytes += section.body.len() as u64,
-            wire::SectionTag::EntityCreate => breakdown.create_bytes += section.body.len() as u64,
-            wire::SectionTag::EntityUpdate => {
-                breakdown.update_masked_bytes += section.body.len() as u64
-            }
-            wire::SectionTag::EntityUpdateSparse | wire::SectionTag::EntityUpdateSparsePacked => {
-                breakdown.update_sparse_bytes += section.body.len() as u64
-            }
-            _ => {}
-        }
-    }
-
-    if header.flags.is_delta_snapshot() {
-        let packet = wire::WirePacket {
-            header: wire::PacketHeader {
-                version: wire::VERSION,
-                flags: wire::PacketFlags::from_raw(header.flags.raw() as u16),
-                schema_hash: schema::schema_hash(schema),
-                tick: header.tick,
-                baseline_tick: header.baseline_tick,
-                payload_len: header.payload_len,
-            },
-            sections,
-        };
-        let decoded = codec::decode_delta_packet(schema, &packet, &CodecLimits::default())
-            .context("decode delta packet")?;
-        breakdown.update_entities += decoded.updates.len() as u64;
-        for entity in decoded.updates {
-            breakdown.update_components += entity.components.len() as u64;
-            for component in entity.components {
-                breakdown.update_fields += component.fields.len() as u64;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn encode_bincode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
@@ -589,6 +534,42 @@ fn write_field_value_naive(writer: &mut BitVecWriter, value: codec::FieldValue) 
     Ok(())
 }
 
+fn record_client_breakdown_packet(
+    breakdown: &mut ClientBreakdown,
+    schema: &schema::Schema,
+    bytes: &[u8],
+) -> Result<()> {
+    let packet = wire::decode_packet(bytes, &WireLimits::default()).context("decode packet")?;
+    breakdown.packets += 1;
+    breakdown.packet_bytes += bytes.len() as u64;
+    for section in &packet.sections {
+        match section.tag {
+            wire::SectionTag::EntityDestroy => breakdown.destroy_bytes += section.body.len() as u64,
+            wire::SectionTag::EntityCreate => breakdown.create_bytes += section.body.len() as u64,
+            wire::SectionTag::EntityUpdate => {
+                breakdown.update_masked_bytes += section.body.len() as u64
+            }
+            wire::SectionTag::EntityUpdateSparse | wire::SectionTag::EntityUpdateSparsePacked => {
+                breakdown.update_sparse_bytes += section.body.len() as u64
+            }
+            _ => {}
+        }
+    }
+
+    if packet.header.flags.is_delta_snapshot() {
+        let decoded = codec::decode_delta_packet(schema, &packet, &CodecLimits::default())
+            .context("decode delta packet")?;
+        breakdown.update_entities += decoded.updates.len() as u64;
+        for entity in decoded.updates {
+            breakdown.update_components += entity.components.len() as u64;
+            for component in entity.components {
+                breakdown.update_fields += component.fields.len() as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_snapshot(tick: codec::SnapshotTick, states: &[DemoEntityState]) -> codec::Snapshot {
     let mut entities: Vec<codec::EntitySnapshot> =
         states.iter().map(DemoEntityState::to_snapshot).collect();
@@ -701,6 +682,49 @@ impl DemoEntityState {
                 ],
             }],
         }
+    }
+}
+
+struct SimbenchWorldView<'a> {
+    states: &'a [DemoEntityState],
+}
+
+impl<'a> WorldView for SimbenchWorldView<'a> {
+    fn snapshot(&self, entity: codec::EntityId) -> codec::EntitySnapshot {
+        self.states
+            .iter()
+            .find(|state| state.id == entity)
+            .expect("entity exists")
+            .to_snapshot()
+    }
+
+    fn update(
+        &self,
+        entity: codec::EntityId,
+        dirty_components: &[schema::ComponentId],
+    ) -> Option<DeltaUpdateEntity> {
+        if dirty_components.is_empty() {
+            return None;
+        }
+        let state = self.states.iter().find(|state| state.id == entity)?;
+        Some(DeltaUpdateEntity {
+            id: state.id,
+            components: vec![DeltaUpdateComponent {
+                id: component_id(),
+                fields: vec![
+                    (0, codec::FieldValue::FixedPoint(state.pos_q[0])),
+                    (1, codec::FieldValue::FixedPoint(state.pos_q[1])),
+                    (2, codec::FieldValue::FixedPoint(state.pos_q[2])),
+                    (3, codec::FieldValue::FixedPoint(state.vel_q[0])),
+                    (4, codec::FieldValue::FixedPoint(state.vel_q[1])),
+                    (5, codec::FieldValue::FixedPoint(state.vel_q[2])),
+                    (6, codec::FieldValue::UInt(state.yaw as u64)),
+                    (7, codec::FieldValue::Bool(state.flags[0])),
+                    (8, codec::FieldValue::Bool(state.flags[1])),
+                    (9, codec::FieldValue::Bool(state.flags[2])),
+                ],
+            }],
+        })
     }
 }
 
@@ -840,15 +864,30 @@ fn run_visibility(
     states: &[DemoEntityState],
     tick: u32,
     baselines: &mut [codec::Snapshot],
-    last_ticks: &mut [codec::SnapshotTick],
-    scratch: &mut CodecScratch,
+    graph: &mut ReplicationGraph,
+    session: &mut SessionEncoder<'_>,
     radius_q: i64,
     stats: &mut PerClientStats,
     mut breakdown: Option<&mut ClientBreakdown>,
 ) -> Result<()> {
     let radius_sq = radius_q * radius_q;
+    let world = SimbenchWorldView { states };
+    let limits = session.limits();
+    let mut encode_buf = vec![0u8; limits.max_section_bytes.max(wire::HEADER_SIZE) * 4];
     for (idx, baseline) in baselines.iter_mut().enumerate() {
         let observer = &states[idx % states.len()];
+        let client_id = ClientId(idx as u32);
+        graph.upsert_client(
+            client_id,
+            ClientView::new(
+                Vec3 {
+                    x: observer.pos_q[0] as f32,
+                    y: observer.pos_q[1] as f32,
+                    z: observer.pos_q[2] as f32,
+                },
+                radius_q as f32,
+            ),
+        );
         let relevant: Vec<DemoEntityState> = states
             .iter()
             .filter(|state| {
@@ -861,25 +900,25 @@ fn run_visibility(
         let snapshot = build_snapshot(codec::SnapshotTick::new(tick), &relevant);
         stats.full_bincode_total += encode_bincode_snapshot(&relevant)? as u64;
 
+        let delta = graph.build_client_delta(client_id, &world);
         if tick > 1 {
             let start = Instant::now();
-            let last_tick = &mut last_ticks[idx];
-            let prev_last_tick = last_tick.raw();
-            let delta_bytes = encode_delta_for_client_with_scratch(
-                schema,
-                baseline,
-                &snapshot,
-                &CodecLimits::default(),
-                scratch,
-                last_tick,
+            let delta_bytes = encode_delta_from_changes(
+                session,
+                codec::SnapshotTick::new(tick),
+                baseline.tick,
+                &delta.creates,
+                &delta.destroys,
+                &delta.updates,
+                &mut encode_buf,
             )?;
             if let Some(breakdown) = breakdown.as_mut() {
-                record_client_breakdown_session(breakdown, schema, &delta_bytes, prev_last_tick)?;
+                record_client_breakdown_packet(breakdown, schema, &encode_buf[..delta_bytes])?;
             }
             let elapsed = start.elapsed();
             stats
                 .sdec
-                .add(delta_bytes.len() as u64, elapsed.as_micros() as u64);
+                .add(delta_bytes as u64, elapsed.as_micros() as u64);
             let naive_start = Instant::now();
             let naive_bytes = encode_naive_delta(schema, baseline, &snapshot)?;
             let naive_elapsed = naive_start.elapsed();
@@ -891,6 +930,33 @@ fn run_visibility(
         *baseline = snapshot;
     }
     Ok(())
+}
+
+fn build_dirty_mask(
+    prev_states: Option<&[DemoEntityState]>,
+    states: &[DemoEntityState],
+) -> Vec<bool> {
+    let mut dirty = Vec::with_capacity(states.len());
+    let Some(prev) = prev_states else {
+        dirty.resize(states.len(), true);
+        return dirty;
+    };
+    if prev.len() != states.len() {
+        dirty.resize(states.len(), true);
+        return dirty;
+    }
+    for (prev_state, state) in prev.iter().zip(states.iter()) {
+        dirty.push(state_changed(prev_state, state));
+    }
+    dirty
+}
+
+fn state_changed(prev: &DemoEntityState, curr: &DemoEntityState) -> bool {
+    prev.id != curr.id
+        || prev.pos_q != curr.pos_q
+        || prev.vel_q != curr.vel_q
+        || prev.yaw != curr.yaw
+        || prev.flags != curr.flags
 }
 
 fn clamp(value: i64, min: i64, max: i64) -> i64 {
