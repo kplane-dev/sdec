@@ -50,6 +50,9 @@ struct Cli {
     /// Simulated reorder rate (0.0 - 1.0) for scenario=loss.
     #[arg(long, default_value_t = 0.0)]
     reorder_rate: f32,
+    /// Validate client state against server state each tick.
+    #[arg(long, default_value_t = false)]
+    validate: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -182,6 +185,7 @@ struct Summary {
     apply_us_p95: u64,
     errors: u64,
     resyncs: u64,
+    validation_errors: u64,
 }
 
 struct ClientState<'a> {
@@ -190,11 +194,18 @@ struct ClientState<'a> {
     entities: EntityMap,
     session: Option<codec::SessionState>,
     last_tick: SnapshotTick,
+    last_applied_tick: SnapshotTick,
+    last_applied_full: bool,
     queue: VecDeque<Vec<u8>>,
     errors: u64,
     encoder: codec::SessionEncoder<'a>,
     delta_buf: Vec<u8>,
     send_buf: Vec<u8>,
+}
+
+struct ServerSnapshot {
+    tick: u32,
+    entities: Vec<(codec::EntityId, PositionYaw)>,
 }
 
 impl<'a> ClientState<'a> {
@@ -211,6 +222,8 @@ impl<'a> ClientState<'a> {
             entities: EntityMap::new(),
             session: None,
             last_tick: SnapshotTick::new(0),
+            last_applied_tick: SnapshotTick::new(0),
+            last_applied_full: false,
             queue: VecDeque::new(),
             errors: 0,
             encoder: codec::SessionEncoder::new(schema, limits),
@@ -250,6 +263,8 @@ fn main() -> Result<()> {
     let mut apply_times = Vec::new();
     let mut errors = 0u64;
     let mut resyncs = 0u64;
+    let mut validation_errors = 0u64;
+    let mut server_snapshots: VecDeque<ServerSnapshot> = VecDeque::new();
 
     let mut sdec_limits = codec::CodecLimits::default();
     let entity_count = cli.entities as usize;
@@ -329,6 +344,17 @@ fn main() -> Result<()> {
             .map(|(entity, _)| server_entities.entity_id(*entity))
             .collect();
         let changes = extract_changes(&schema, &mut server_world, &mut server_entities);
+
+        if cli.validate {
+            let snapshot = build_server_snapshot(&mut server_world, &mut server_entities);
+            server_snapshots.push_back(ServerSnapshot {
+                tick,
+                entities: snapshot,
+            });
+            while server_snapshots.len() > 256 {
+                server_snapshots.pop_front();
+            }
+        }
 
         let mut dirty_map: HashMap<codec::EntityId, Vec<schema::ComponentId>> = HashMap::new();
         for update in &changes.updates {
@@ -463,7 +489,9 @@ fn main() -> Result<()> {
                             &mut client_state.entities,
                             &snapshot,
                         );
-                        Ok(())
+                        client_state.last_applied_tick = SnapshotTick::new(tick);
+                        client_state.last_applied_full = true;
+                        Ok(AppliedPacket::Full(SnapshotTick::new(tick)))
                     }
                     Mode::Lightyear => {
                         let snapshot: SnapshotData =
@@ -473,9 +501,25 @@ fn main() -> Result<()> {
                             &mut client_state.entities,
                             &snapshot,
                         );
-                        Ok(())
+                        client_state.last_applied_tick = SnapshotTick::new(tick);
+                        client_state.last_applied_full = true;
+                        Ok(AppliedPacket::Full(SnapshotTick::new(tick)))
                     }
                 };
+                if matches!(cli.mode, Mode::Sdec) {
+                    if let Ok(applied) = &apply_result {
+                        match *applied {
+                            AppliedPacket::Full(tick) => {
+                                client_state.last_applied_tick = tick;
+                                client_state.last_applied_full = true;
+                            }
+                            AppliedPacket::Delta(tick) => {
+                                client_state.last_applied_tick = tick;
+                                client_state.last_applied_full = false;
+                            }
+                        }
+                    }
+                }
                 if matches!(cli.mode, Mode::Sdec) {
                     client_state.send_buf = delivered;
                 }
@@ -483,6 +527,14 @@ fn main() -> Result<()> {
                     errors += 1;
                     client_state.errors += 1;
                     if matches!(cli.mode, Mode::Sdec) {
+                        let resync_tick = SnapshotTick::new(
+                            client_state
+                                .session
+                                .as_ref()
+                                .map(|state| state.last_tick.raw())
+                                .unwrap_or(0)
+                                + 1,
+                        );
                         if let Ok(resynced) = resync_client(
                             &schema,
                             &mut server_world,
@@ -495,11 +547,92 @@ fn main() -> Result<()> {
                         ) {
                             if resynced {
                                 resyncs += 1;
+                                client_state.last_applied_tick = resync_tick;
+                                client_state.last_applied_full = true;
+                                if cli.validate {
+                                    let snapshot = build_server_snapshot(
+                                        &mut server_world,
+                                        &mut server_entities,
+                                    );
+                                    server_snapshots.push_back(ServerSnapshot {
+                                        tick: resync_tick.raw(),
+                                        entities: snapshot,
+                                    });
+                                    while server_snapshots.len() > 256 {
+                                        server_snapshots.pop_front();
+                                    }
+                                }
+                                if cli.validate {
+                                    if let Some(snapshot) = server_snapshots
+                                        .iter()
+                                        .find(|entry| entry.tick == resync_tick.raw())
+                                    {
+                                        let expected_ids = if matches!(cli.scenario, Scenario::Loss)
+                                        {
+                                            client_state.entities.ids().into_iter().collect()
+                                        } else if visibility_radius <= 0 {
+                                            snapshot.entities.iter().map(|(id, _)| *id).collect()
+                                        } else {
+                                            visible_entity_ids_snapshot(
+                                                snapshot,
+                                                client_positions[client_idx],
+                                                visibility_radius,
+                                            )
+                                        };
+                                        let (server_count, server_hash) =
+                                            state_digest_snapshot(snapshot, &expected_ids);
+                                        let (client_count, client_hash) = state_digest(
+                                            &mut client_state.world,
+                                            &client_state.entities,
+                                            &expected_ids,
+                                        );
+                                        if client_count != server_count
+                                            || client_hash != server_hash
+                                        {
+                                            validation_errors += 1;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 } else {
                     apply_times.push(apply_start.elapsed());
+                    if cli.validate {
+                        if matches!(cli.scenario, Scenario::Loss) && !client_state.last_applied_full
+                        {
+                            continue;
+                        }
+                        let applied_tick = client_state.last_applied_tick.raw();
+                        if applied_tick > 0 {
+                            let snapshot = server_snapshots
+                                .iter()
+                                .find(|entry| entry.tick == applied_tick);
+                            if let Some(snapshot) = snapshot {
+                                let expected_ids = if matches!(cli.scenario, Scenario::Loss) {
+                                    client_state.entities.ids().into_iter().collect()
+                                } else if visibility_radius <= 0 {
+                                    snapshot.entities.iter().map(|(id, _)| *id).collect()
+                                } else {
+                                    visible_entity_ids_snapshot(
+                                        snapshot,
+                                        client_positions[client_idx],
+                                        visibility_radius,
+                                    )
+                                };
+                                let (server_count, server_hash) =
+                                    state_digest_snapshot(snapshot, &expected_ids);
+                                let (client_count, client_hash) = state_digest(
+                                    &mut client_state.world,
+                                    &client_state.entities,
+                                    &expected_ids,
+                                );
+                                if client_count != server_count || client_hash != server_hash {
+                                    validation_errors += 1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -529,6 +662,7 @@ fn main() -> Result<()> {
         apply_us_p95: p95_duration_us(&mut apply_times.clone()),
         errors,
         resyncs,
+        validation_errors,
     };
 
     let out_path = cli.out_dir.join("summary.json");
@@ -594,6 +728,24 @@ fn visible_entity_ids(
     visible
 }
 
+fn visible_entity_ids_snapshot(
+    snapshot: &ServerSnapshot,
+    client_pos: (i64, i64),
+    radius: i64,
+) -> HashSet<codec::EntityId> {
+    let mut visible = HashSet::new();
+    let radius_sq = radius.saturating_mul(radius);
+    for (id, pos) in &snapshot.entities {
+        let dx = pos.x_q - client_pos.0;
+        let dy = pos.y_q - client_pos.1;
+        let dist_sq = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+        if dist_sq <= radius_sq {
+            visible.insert(*id);
+        }
+    }
+    visible
+}
+
 struct DemoWorldView<'a> {
     schema: &'a sdec_bevy::BevySchema,
     world: &'a World,
@@ -650,6 +802,12 @@ fn build_sdec_snapshot_for_ids(
     snapshots
 }
 
+#[derive(Clone, Copy)]
+enum AppliedPacket {
+    Full(SnapshotTick),
+    Delta(SnapshotTick),
+}
+
 fn apply_sdec_packet(
     schema: &sdec_bevy::BevySchema,
     world: &mut World,
@@ -657,7 +815,7 @@ fn apply_sdec_packet(
     session: &mut Option<codec::SessionState>,
     limits: &codec::CodecLimits,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<AppliedPacket> {
     if bytes.len() >= 4 {
         let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if magic == wire::MAGIC {
@@ -669,7 +827,7 @@ fn apply_sdec_packet(
             if let Some(state) = session.as_mut() {
                 state.last_tick = snapshot.tick;
             }
-            return Ok(());
+            return Ok(AppliedPacket::Full(snapshot.tick));
         }
     }
 
@@ -687,7 +845,7 @@ fn apply_sdec_packet(
         &decoded.destroys,
         &decoded.updates,
     )?;
-    Ok(())
+    Ok(AppliedPacket::Delta(session.last_tick))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -713,7 +871,7 @@ fn resync_client(
         limits,
         &mut buf,
     )?;
-    apply_sdec_packet(
+    let _ = apply_sdec_packet(
         schema,
         client_world,
         client_entities,
@@ -889,6 +1047,71 @@ fn apply_full_snapshot(
         }
     }
     Ok(())
+}
+
+fn state_digest(
+    world: &mut World,
+    entities: &EntityMap,
+    expected_ids: &HashSet<codec::EntityId>,
+) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut hash = 0u64;
+    let mut query = world.query::<&PositionYaw>();
+    let mut ids: Vec<codec::EntityId> = expected_ids.iter().copied().collect();
+    ids.sort_by_key(|id| id.raw());
+    for id in ids {
+        let Some(entity) = entities.entity(id) else {
+            continue;
+        };
+        if let Ok(position) = query.get(world, entity) {
+            count += 1;
+            hash = mix_hash(hash, position);
+        }
+    }
+    (count, hash)
+}
+
+fn build_server_snapshot(
+    world: &mut World,
+    entities: &mut EntityMap,
+) -> Vec<(codec::EntityId, PositionYaw)> {
+    let mut entries = Vec::new();
+    let mut query = world.query::<(Entity, &PositionYaw)>();
+    for (entity, position) in query.iter(world) {
+        let id = entities.entity_id(entity);
+        entries.push((id, *position));
+    }
+    entries.sort_by_key(|(id, _)| id.raw());
+    entries
+}
+
+fn state_digest_snapshot(
+    snapshot: &ServerSnapshot,
+    expected_ids: &HashSet<codec::EntityId>,
+) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut hash = 0u64;
+    for (id, position) in &snapshot.entities {
+        if !expected_ids.contains(id) {
+            continue;
+        }
+        count += 1;
+        hash = mix_hash(hash, position);
+    }
+    (count, hash)
+}
+
+fn mix_hash(mut hash: u64, position: &PositionYaw) -> u64 {
+    hash = hash
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(position.x_q as u64);
+    hash = hash
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(position.y_q as u64);
+    hash = hash
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(position.yaw as u64);
+    hash
 }
 
 fn build_compact_packet(
