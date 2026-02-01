@@ -165,6 +165,7 @@ pub fn encode_delta_from_changes(
 ///
 /// This is a lower-level helper. Prefer `encode_delta_from_changes` with a
 /// `SessionEncoder` for production use.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_delta_snapshot_from_updates(
     schema: &schema::Schema,
     tick: SnapshotTick,

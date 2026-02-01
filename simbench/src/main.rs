@@ -967,10 +967,10 @@ fn build_dirty_updates(
     Ok(updates)
 }
 
-fn find_component<'a>(
-    entity: &'a codec::EntitySnapshot,
+fn find_component(
+    entity: &codec::EntitySnapshot,
     id: schema::ComponentId,
-) -> Option<&'a codec::ComponentSnapshot> {
+) -> Option<&codec::ComponentSnapshot> {
     entity
         .components
         .iter()
@@ -1077,6 +1077,7 @@ struct Summary {
 }
 
 impl Summary {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cli: &Cli,
         full_count: u32,
