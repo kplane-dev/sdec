@@ -41,6 +41,12 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.7.1] - 2026-01-31
+
+### Changed
+- Publish workflow now includes `sdec-repgraph` and `sdec-tools`.
+- Bump workspace and internal crate versions to 0.7.1.
+
 ## [0.7.0] - 2026-01-31
 
 ### Added
