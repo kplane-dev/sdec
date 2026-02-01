@@ -3,7 +3,7 @@
 //! This crate provides interest management and per-client change list
 //! generation that feeds directly into `codec::encode_delta_from_changes`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codec::{DeltaUpdateEntity, EntitySnapshot};
 use schema::ComponentId;
@@ -204,10 +204,12 @@ impl ReplicationGraph {
         };
 
         let radius_sq = state.view.radius * state.view.radius;
-        let mut relevant: BTreeSet<codec::EntityId> = BTreeSet::new();
+        let mut relevant = Vec::with_capacity(self.entities.len());
+        let mut relevant_set = HashSet::with_capacity(self.entities.len());
         for (id, entry) in &self.entities {
             if entry.position.distance_sq(state.view.position) <= radius_sq {
-                relevant.insert(*id);
+                relevant.push(*id);
+                relevant_set.insert(*id);
             }
         }
 
@@ -227,28 +229,30 @@ impl ReplicationGraph {
             }
         }
 
-        let mut destroys: Vec<codec::EntityId> = state
-            .known_entities
-            .difference(&relevant)
-            .copied()
-            .collect();
+        let mut destroys = Vec::new();
+        let mut destroys_set = HashSet::with_capacity(state.known_entities.len());
+        for id in state.known_entities.iter().copied() {
+            if !relevant_set.contains(&id) {
+                destroys.push(id);
+                destroys_set.insert(id);
+            }
+        }
         for removed in &self.removed_entities {
-            if state.known_entities.contains(removed) && !destroys.contains(removed) {
+            if state.known_entities.contains(removed) && !destroys_set.contains(removed) {
                 destroys.push(*removed);
+                destroys_set.insert(*removed);
             }
         }
         destroys.sort_by_key(|id| id.raw());
 
         apply_budget(&mut creates, &mut updates, &mut destroys, state.view.budget);
 
-        let mut next_known = state.known_entities.clone();
         for destroy in &destroys {
-            next_known.remove(destroy);
+            state.known_entities.remove(destroy);
         }
         for create in &creates {
-            next_known.insert(create.id);
+            state.known_entities.insert(create.id);
         }
-        state.known_entities = next_known;
 
         ClientDelta {
             creates,
