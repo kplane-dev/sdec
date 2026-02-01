@@ -22,6 +22,9 @@ what gets encoded and feeds directly into `codec::encode_delta_from_changes`.
 🚧 **Work in Progress** — Core protocol is stable; sessions/compact headers and repgraph
 integration are active, and public APIs are still evolving.
 
+Full snapshots are for **initial sync and recovery**. Compact deltas are for
+**steady-state replication**.
+
 ## Initial Results (Simbench)
 
 - Global delta size (dense): 259B avg, 266B p95 (vs 268B/282B naive).
