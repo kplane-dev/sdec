@@ -53,6 +53,9 @@ struct Cli {
     /// Validate client state against server state each tick.
     #[arg(long, default_value_t = false)]
     validate: bool,
+    /// Enable field-level thresholds for PositionYaw updates (trade accuracy for CPU/bw).
+    #[arg(long, default_value_t = false)]
+    threshold_updates: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -260,6 +263,7 @@ fn main() -> Result<()> {
 
     let mut server_world = World::new();
     let mut server_entities = EntityMap::new();
+    let mut server_last_positions: HashMap<codec::EntityId, PositionYaw> = HashMap::new();
 
     let mut rng = Rng::new(cli.seed);
     for _ in 0..cli.entities {
@@ -270,6 +274,12 @@ fn main() -> Result<()> {
         };
         let server = server_world.spawn(position).id();
         let _ = server_entities.entity_id(server);
+    }
+    if cli.threshold_updates {
+        for (entity, pos) in collect_positions(&mut server_world) {
+            let id = server_entities.entity_id(entity);
+            server_last_positions.insert(id, pos);
+        }
     }
 
     let mut bytes = Vec::new();
@@ -421,6 +431,8 @@ fn main() -> Result<()> {
                         schema: &schema,
                         world: &server_world,
                         entities: &server_entities,
+                        last_positions: &server_last_positions,
+                        threshold_updates: cli.threshold_updates,
                     };
                     let delta = graph.build_client_delta(client_state.client_id, &world_view);
                     if matches!(cli.mode, Mode::Sdec) {
@@ -677,6 +689,12 @@ fn main() -> Result<()> {
 
         graph.clear_dirty();
         graph.clear_removed();
+        if cli.threshold_updates {
+            for (entity, pos) in &positions {
+                let id = server_entities.entity_id(*entity);
+                server_last_positions.insert(id, *pos);
+            }
+        }
         // Advance Bevy change detection so Changed/Added/Removed are per-tick.
         server_world.clear_trackers();
     }
@@ -804,6 +822,8 @@ struct DemoWorldView<'a> {
     schema: &'a sdec_bevy::BevySchema,
     world: &'a World,
     entities: &'a EntityMap,
+    last_positions: &'a HashMap<codec::EntityId, PositionYaw>,
+    threshold_updates: bool,
 }
 
 impl<'a> WorldView for DemoWorldView<'a> {
@@ -827,8 +847,69 @@ impl<'a> WorldView for DemoWorldView<'a> {
         dirty_components: &[schema::ComponentId],
     ) -> Option<codec::DeltaUpdateEntity> {
         let bevy_entity = self.entities.entity(entity)?;
-        self.schema
-            .build_delta_update(self.world, bevy_entity, entity, dirty_components)
+        if !self.threshold_updates {
+            return self.schema.build_delta_update(
+                self.world,
+                bevy_entity,
+                entity,
+                dirty_components,
+            );
+        }
+        let pos_component = schema::ComponentId::new(PositionYaw::COMPONENT_ID)
+            .expect("component id must be non-zero");
+        let mut components = Vec::with_capacity(dirty_components.len());
+        for component_id in dirty_components {
+            if *component_id == pos_component {
+                if let Some(update) = self.position_update(entity, bevy_entity) {
+                    components.push(update);
+                }
+            } else if let Some(update) =
+                self.schema
+                    .build_delta_update(self.world, bevy_entity, entity, &[*component_id])
+            {
+                components.extend(update.components);
+            }
+        }
+        if components.is_empty() {
+            None
+        } else {
+            Some(codec::DeltaUpdateEntity {
+                id: entity,
+                components,
+            })
+        }
+    }
+}
+
+impl<'a> DemoWorldView<'a> {
+    fn position_update(
+        &self,
+        entity_id: codec::EntityId,
+        bevy_entity: Entity,
+    ) -> Option<codec::DeltaUpdateComponent> {
+        const POS_THRESHOLD_Q: i64 = 5;
+        const YAW_THRESHOLD_Q: u16 = 1;
+        let current = *self.world.get::<PositionYaw>(bevy_entity)?;
+        let prev = self.last_positions.get(&entity_id);
+        let mut fields = Vec::new();
+        if prev.is_none() || (current.x_q - prev.unwrap().x_q).abs() >= POS_THRESHOLD_Q {
+            fields.push((0, FieldValue::FixedPoint(current.x_q)));
+        }
+        if prev.is_none() || (current.y_q - prev.unwrap().y_q).abs() >= POS_THRESHOLD_Q {
+            fields.push((1, FieldValue::FixedPoint(current.y_q)));
+        }
+        if prev.is_none() || current.yaw.abs_diff(prev.unwrap().yaw) >= YAW_THRESHOLD_Q {
+            fields.push((2, FieldValue::UInt(current.yaw as u64)));
+        }
+        if fields.is_empty() {
+            None
+        } else {
+            Some(codec::DeltaUpdateComponent {
+                id: schema::ComponentId::new(PositionYaw::COMPONENT_ID)
+                    .expect("component id must be non-zero"),
+                fields,
+            })
+        }
     }
 }
 
