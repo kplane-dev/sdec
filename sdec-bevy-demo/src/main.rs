@@ -184,6 +184,8 @@ fn main() -> Result<()> {
     let mut bytes = Vec::new();
     let mut enc_times = Vec::new();
     let mut apply_times = Vec::new();
+    let sdec_limits = codec::CodecLimits::default();
+    let mut sdec_encoder = codec::SessionEncoder::new(schema.schema(), &sdec_limits);
 
     for tick in 1..=cli.ticks {
         step_positions(&mut server_world, &mut rng);
@@ -191,22 +193,34 @@ fn main() -> Result<()> {
         let start = Instant::now();
         let payload = match cli.mode {
             Mode::Sdec => {
-                let changes = extract_changes(&schema, &mut server_world, &mut server_entities);
-                let mut buf = vec![0u8; 16 * 1024];
-                let len = codec::encode_delta_from_changes(
-                    &mut codec::SessionEncoder::new(
+                if tick == 1 {
+                    let snapshot =
+                        build_sdec_snapshot(&schema, &mut server_world, &mut server_entities);
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let len = codec::encode_full_snapshot(
                         schema.schema(),
-                        &codec::CodecLimits::default(),
-                    ),
-                    SnapshotTick::new(tick),
-                    SnapshotTick::new(tick.saturating_sub(1)),
-                    &changes.creates,
-                    &changes.destroys,
-                    &changes.updates,
-                    &mut buf,
-                )?;
-                buf.truncate(len);
-                buf
+                        SnapshotTick::new(tick),
+                        &snapshot,
+                        &sdec_limits,
+                        &mut buf,
+                    )?;
+                    buf.truncate(len);
+                    buf
+                } else {
+                    let changes = extract_changes(&schema, &mut server_world, &mut server_entities);
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let len = codec::encode_delta_from_changes(
+                        &mut sdec_encoder,
+                        SnapshotTick::new(tick),
+                        SnapshotTick::new(tick.saturating_sub(1)),
+                        &changes.creates,
+                        &changes.destroys,
+                        &changes.updates,
+                        &mut buf,
+                    )?;
+                    buf.truncate(len);
+                    buf
+                }
             }
             Mode::Naive => {
                 let snapshot = build_snapshot(&mut server_world);
@@ -223,21 +237,33 @@ fn main() -> Result<()> {
             let apply_start = Instant::now();
             match cli.mode {
                 Mode::Sdec => {
-                    let packet = wire::decode_packet(&payload, &wire::Limits::default())
-                        .context("decode")?;
-                    let decoded = codec::decode_delta_packet(
-                        schema.schema(),
-                        &packet,
-                        &codec::CodecLimits::default(),
-                    )?;
-                    apply_changes(
-                        &schema,
-                        &mut client_world,
-                        &mut client_entities,
-                        &decoded.creates,
-                        &decoded.destroys,
-                        &decoded.updates,
-                    )?;
+                    if tick == 1 {
+                        let snapshot = codec::decode_full_snapshot(
+                            schema.schema(),
+                            &payload,
+                            &wire::Limits::default(),
+                            &sdec_limits,
+                        )?;
+                        apply_full_snapshot(
+                            &schema,
+                            &mut client_world,
+                            &client_entities,
+                            &snapshot,
+                        )?;
+                    } else {
+                        let packet = wire::decode_packet(&payload, &wire::Limits::default())
+                            .context("decode")?;
+                        let decoded =
+                            codec::decode_delta_packet(schema.schema(), &packet, &sdec_limits)?;
+                        apply_changes(
+                            &schema,
+                            &mut client_world,
+                            &mut client_entities,
+                            &decoded.creates,
+                            &decoded.destroys,
+                            &decoded.updates,
+                        )?;
+                    }
                 }
                 Mode::Naive => {
                     let snapshot: SnapshotData =
@@ -309,6 +335,48 @@ fn apply_snapshot(world: &mut World, entities: &[Entity], snapshot: &SnapshotDat
             *pos = next;
         }
     }
+}
+
+fn build_sdec_snapshot(
+    schema: &sdec_bevy::BevySchema,
+    world: &mut World,
+    entities: &mut EntityMap,
+) -> Vec<codec::EntitySnapshot> {
+    let mut query = world.query::<Entity>();
+    let mut snapshots: Vec<codec::EntitySnapshot> = query
+        .iter(world)
+        .filter_map(|entity| {
+            let components = schema.snapshot_entity(world, entity);
+            if components.is_empty() {
+                return None;
+            }
+            Some(codec::EntitySnapshot {
+                id: entities.entity_id(entity),
+                components,
+            })
+        })
+        .collect();
+    snapshots.sort_by_key(|snapshot| snapshot.id.raw());
+    snapshots
+}
+
+fn apply_full_snapshot(
+    schema: &sdec_bevy::BevySchema,
+    world: &mut World,
+    entities: &EntityMap,
+    snapshot: &codec::Snapshot,
+) -> Result<()> {
+    for entity_snapshot in &snapshot.entities {
+        let Some(entity) = entities.entity(entity_snapshot.id) else {
+            continue;
+        };
+        for component in &entity_snapshot.components {
+            let fields: Vec<(usize, FieldValue)> =
+                component.fields.iter().copied().enumerate().collect();
+            schema.apply_component_fields(world, entity, component.id, &fields)?;
+        }
+    }
+    Ok(())
 }
 
 fn avg_u64(values: &[u64]) -> u64 {

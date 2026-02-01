@@ -188,11 +188,24 @@ impl BevySchema {
             .find(|adapter| adapter.component_id() == component_id)
     }
 
-    pub(crate) fn snapshot_entity(&self, world: &World, entity: Entity) -> Vec<ComponentSnapshot> {
+    pub fn snapshot_entity(&self, world: &World, entity: Entity) -> Vec<ComponentSnapshot> {
         self.adapters
             .iter()
             .filter_map(|adapter| adapter.snapshot_component(world, entity))
             .collect()
+    }
+
+    pub fn apply_component_fields(
+        &self,
+        world: &mut World,
+        entity: Entity,
+        component_id: ComponentId,
+        fields: &[(usize, FieldValue)],
+    ) -> Result<()> {
+        let adapter = self
+            .adapter_by_component(component_id)
+            .ok_or_else(|| anyhow!("unknown component {:?}", component_id))?;
+        adapter.apply_update(world, entity, fields)
     }
 }
 
