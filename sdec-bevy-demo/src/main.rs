@@ -24,7 +24,7 @@ struct Cli {
     /// RNG seed for deterministic results.
     #[arg(long, default_value_t = 1)]
     seed: u64,
-    /// Replication mode (sdec or naive).
+    /// Replication mode (sdec, naive, or lightyear).
     #[arg(long, value_enum, default_value_t = Mode::Sdec)]
     mode: Mode,
     /// Output directory for summary.json.
@@ -39,9 +39,12 @@ struct Cli {
 enum Mode {
     Sdec,
     Naive,
+    Lightyear,
 }
 
-#[derive(Component, Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(
+    Component, Debug, Clone, Copy, Serialize, Deserialize, bitcode::Encode, bitcode::Decode,
+)]
 struct PositionYaw {
     x_q: i64,
     y_q: i64,
@@ -162,6 +165,7 @@ fn main() -> Result<()> {
     let mut client_world = World::new();
     let mut server_entities = EntityMap::new();
     let mut client_entities = EntityMap::new();
+    let mut client_entity_list = Vec::new();
 
     let mut rng = Rng::new(cli.seed);
     for _ in 0..cli.entities {
@@ -174,6 +178,7 @@ fn main() -> Result<()> {
         let client = client_world.spawn(position).id();
         let _ = server_entities.entity_id(server);
         let _ = client_entities.entity_id(client);
+        client_entity_list.push(client);
     }
 
     let mut bytes = Vec::new();
@@ -207,6 +212,10 @@ fn main() -> Result<()> {
                 let snapshot = build_snapshot(&mut server_world);
                 bincode::serialize(&snapshot).context("serialize naive snapshot")?
             }
+            Mode::Lightyear => {
+                let snapshot = build_snapshot(&mut server_world);
+                bitcode::encode(&snapshot)
+            }
         };
         let encode_elapsed = start.elapsed();
 
@@ -231,8 +240,14 @@ fn main() -> Result<()> {
                     )?;
                 }
                 Mode::Naive => {
-                    let _: SnapshotData =
+                    let snapshot: SnapshotData =
                         bincode::deserialize(&payload).context("deserialize naive snapshot")?;
+                    apply_snapshot(&mut client_world, &client_entity_list, &snapshot);
+                }
+                Mode::Lightyear => {
+                    let snapshot: SnapshotData =
+                        bitcode::decode(&payload).context("bitcode decode")?;
+                    apply_snapshot(&mut client_world, &client_entity_list, &snapshot);
                 }
             }
             apply_times.push(apply_start.elapsed());
@@ -272,7 +287,7 @@ fn step_positions(world: &mut World, rng: &mut Rng) {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, bitcode::Encode, bitcode::Decode)]
 struct SnapshotData {
     entities: Vec<PositionYaw>,
 }
@@ -281,6 +296,19 @@ fn build_snapshot(world: &mut World) -> SnapshotData {
     let mut query = world.query::<&PositionYaw>();
     let entities = query.iter(world).cloned().collect();
     SnapshotData { entities }
+}
+
+fn apply_snapshot(world: &mut World, entities: &[Entity], snapshot: &SnapshotData) {
+    let mut query = world.query::<&mut PositionYaw>();
+    for (entity, next) in entities
+        .iter()
+        .copied()
+        .zip(snapshot.entities.iter().copied())
+    {
+        if let Ok(mut pos) = query.get_mut(world, entity) {
+            *pos = next;
+        }
+    }
 }
 
 fn avg_u64(values: &[u64]) -> u64 {
