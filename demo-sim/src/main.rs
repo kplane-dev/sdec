@@ -3,18 +3,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use codec::session::{
-    decode_session_init_packet, decode_session_packet, encode_session_init_packet,
-    CompactHeaderMode, SessionState,
-};
 use codec::{
-    apply_delta_snapshot_from_packet, decode_full_snapshot_from_packet,
-    encode_delta_snapshot_for_client_session, encode_full_snapshot, CodecLimits, Snapshot,
+    apply_delta_snapshot_from_packet, decode_full_snapshot_from_packet, decode_session_init_packet,
+    decode_session_packet, encode_delta_snapshot_for_client_session, encode_full_snapshot,
+    encode_session_init_packet, CodecLimits, CompactHeaderMode, SessionState, Snapshot,
     SnapshotTick, WireLimits,
 };
 use demo_schema::{demo_schema, DemoEntityState, POS_MAX, POS_MIN, VEL_MAX, VEL_MIN};
 use serde::Serialize;
-use tools::{build_decode_output, decode_packet_json};
+use tools::{build_decode_output, decode_packet_json, inspect_packet};
 use wire::decode_packet;
 
 #[derive(Parser)]
@@ -82,8 +79,8 @@ fn main() -> Result<()> {
         decode_packet(&session_buf, &wire_limits).context("decode session init")?;
     let session_state = decode_session_init_packet(&schema, &session_packet, &limits)
         .context("decode session init")?;
-    let _ = decode_packet_json(&session_buf, &schema, &wire_limits, &limits)
-        .context("tools decode session init")?;
+    let _ = inspect_packet(&session_buf, None, &wire_limits, &limits)
+        .context("tools inspect session init")?;
 
     let mut rng = Rng::new(cli.seed);
     let mut states = init_states(cli.players, &mut rng);
