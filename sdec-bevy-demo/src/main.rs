@@ -627,6 +627,7 @@ fn apply_sdec_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resync_client(
     schema: &sdec_bevy::BevySchema,
     server_world: &mut World,
