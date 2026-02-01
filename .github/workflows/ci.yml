@@ -139,3 +139,10 @@ jobs:
           else
             echo "No fuzz directory yet, skipping"
           fi
+      - name: Run short fuzz smoke test
+        run: |
+          if [ -d "fuzz" ]; then
+            cargo +nightly fuzz run session_packet -- -max_total_time=30
+          else
+            echo "No fuzz directory yet, skipping"
+          fi
