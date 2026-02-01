@@ -144,6 +144,7 @@ struct Summary {
     ticks: u32,
     entities: u32,
     drop_rate: f32,
+    session_init_bytes: u64,
     bytes_avg: u64,
     bytes_p95: u64,
     encode_us_avg: u64,
@@ -186,6 +187,30 @@ fn main() -> Result<()> {
     let mut apply_times = Vec::new();
     let sdec_limits = codec::CodecLimits::default();
     let mut sdec_encoder = codec::SessionEncoder::new(schema.schema(), &sdec_limits);
+    let mut sdec_last_tick = SnapshotTick::new(0);
+    let mut sdec_session_init_bytes = 0u64;
+    let mut client_session: Option<codec::SessionState> = None;
+
+    if matches!(cli.mode, Mode::Sdec) {
+        let mut init_buf = vec![0u8; 128];
+        let init_len = codec::encode_session_init_packet(
+            schema.schema(),
+            SnapshotTick::new(0),
+            Some(1),
+            codec::CompactHeaderMode::SessionV1,
+            &sdec_limits,
+            &mut init_buf,
+        )?;
+        init_buf.truncate(init_len);
+        sdec_session_init_bytes = init_len as u64;
+
+        let init_packet = wire::decode_packet(&init_buf, &wire::Limits::default())
+            .context("decode session init")?;
+        let session =
+            codec::decode_session_init_packet(schema.schema(), &init_packet, &sdec_limits)
+                .context("decode session init packet")?;
+        client_session = Some(session);
+    }
 
     for tick in 1..=cli.ticks {
         step_positions(&mut server_world, &mut rng);
@@ -205,6 +230,7 @@ fn main() -> Result<()> {
                         &mut buf,
                     )?;
                     buf.truncate(len);
+                    sdec_last_tick = SnapshotTick::new(tick);
                     buf
                 } else {
                     let changes = extract_changes(&schema, &mut server_world, &mut server_entities);
@@ -219,7 +245,16 @@ fn main() -> Result<()> {
                         &mut buf,
                     )?;
                     buf.truncate(len);
-                    buf
+                    let payload = &buf[wire::HEADER_SIZE..];
+                    let (compact, new_last_tick) = build_compact_packet(
+                        wire::SessionFlags::delta_snapshot(),
+                        sdec_last_tick,
+                        SnapshotTick::new(tick),
+                        SnapshotTick::new(tick.saturating_sub(1)),
+                        payload,
+                    )?;
+                    sdec_last_tick = new_last_tick;
+                    compact
                 }
             }
             Mode::Naive => {
@@ -238,10 +273,11 @@ fn main() -> Result<()> {
             match cli.mode {
                 Mode::Sdec => {
                     if tick == 1 {
-                        let snapshot = codec::decode_full_snapshot(
+                        let packet = wire::decode_packet(&payload, &wire::Limits::default())
+                            .context("decode full snapshot")?;
+                        let snapshot = codec::decode_full_snapshot_from_packet(
                             schema.schema(),
-                            &payload,
-                            &wire::Limits::default(),
+                            &packet,
                             &sdec_limits,
                         )?;
                         apply_full_snapshot(
@@ -250,9 +286,19 @@ fn main() -> Result<()> {
                             &client_entities,
                             &snapshot,
                         )?;
+                        if let Some(session) = client_session.as_mut() {
+                            session.last_tick = SnapshotTick::new(tick);
+                        }
                     } else {
-                        let packet = wire::decode_packet(&payload, &wire::Limits::default())
-                            .context("decode")?;
+                        let session = client_session
+                            .as_mut()
+                            .ok_or_else(|| anyhow::anyhow!("session init missing"))?;
+                        let packet = codec::decode_session_packet(
+                            schema.schema(),
+                            session,
+                            &payload,
+                            &wire::Limits::default(),
+                        )?;
                         let decoded =
                             codec::decode_delta_packet(schema.schema(), &packet, &sdec_limits)?;
                         apply_changes(
@@ -288,6 +334,7 @@ fn main() -> Result<()> {
         ticks: cli.ticks,
         entities: cli.entities,
         drop_rate: cli.drop_rate,
+        session_init_bytes: sdec_session_init_bytes,
         bytes_avg: avg_u64(&bytes),
         bytes_p95: p95_u64(&mut bytes.clone()),
         encode_us_avg: avg_duration_us(&enc_times),
@@ -377,6 +424,39 @@ fn apply_full_snapshot(
         }
     }
     Ok(())
+}
+
+fn build_compact_packet(
+    flags: wire::SessionFlags,
+    last_tick: SnapshotTick,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    payload: &[u8],
+) -> Result<(Vec<u8>, SnapshotTick)> {
+    let tick_raw = tick.raw();
+    let last_raw = last_tick.raw();
+    let tick_delta = tick_raw
+        .checked_sub(last_raw)
+        .ok_or_else(|| anyhow::anyhow!("tick went backwards"))?;
+    if tick_delta == 0 {
+        anyhow::bail!("tick delta must be non-zero for compact packets");
+    }
+
+    let baseline_delta = tick_raw
+        .checked_sub(baseline_tick.raw())
+        .ok_or_else(|| anyhow::anyhow!("baseline tick ahead of tick"))?;
+    let mut buf = vec![0u8; wire::SESSION_MAX_HEADER_SIZE + payload.len()];
+    let header_len = wire::encode_session_header(
+        &mut buf,
+        flags,
+        tick_delta,
+        baseline_delta,
+        payload.len() as u32,
+    )
+    .map_err(|err| anyhow::anyhow!("encode session header: {err:?}"))?;
+    buf[header_len..header_len + payload.len()].copy_from_slice(payload);
+    buf.truncate(header_len + payload.len());
+    Ok((buf, tick))
 }
 
 fn avg_u64(values: &[u64]) -> u64 {
