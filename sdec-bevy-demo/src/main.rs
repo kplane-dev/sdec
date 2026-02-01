@@ -186,6 +186,20 @@ struct Summary {
     errors: u64,
     resyncs: u64,
     validation_errors: u64,
+    total_create_entities: u64,
+    total_create_components: u64,
+    total_create_fields: u64,
+    total_update_entities: u64,
+    total_update_components: u64,
+    total_update_fields: u64,
+    total_destroy_entities: u64,
+    avg_create_entities_per_client_tick: f64,
+    avg_create_components_per_client_tick: f64,
+    avg_create_fields_per_client_tick: f64,
+    avg_update_entities_per_client_tick: f64,
+    avg_update_components_per_client_tick: f64,
+    avg_update_fields_per_client_tick: f64,
+    avg_destroy_entities_per_client_tick: f64,
 }
 
 struct ClientState<'a> {
@@ -279,6 +293,13 @@ fn main() -> Result<()> {
     let delta_buf_size = (entity_count.saturating_mul(512)).max(4 * 1024 * 1024);
     let send_buf_size = full_buf_size.max(delta_buf_size);
     let mut sdec_session_init_bytes = 0u64;
+    let mut total_create_entities = 0u64;
+    let mut total_create_components = 0u64;
+    let mut total_create_fields = 0u64;
+    let mut total_update_entities = 0u64;
+    let mut total_update_components = 0u64;
+    let mut total_update_fields = 0u64;
+    let mut total_destroy_entities = 0u64;
 
     let client_positions = build_client_positions(clients, &mut rng);
     let view_radius = if visibility_radius <= 0 {
@@ -402,6 +423,23 @@ fn main() -> Result<()> {
                         entities: &server_entities,
                     };
                     let delta = graph.build_client_delta(client_state.client_id, &world_view);
+                    if matches!(cli.mode, Mode::Sdec) {
+                        total_create_entities += delta.creates.len() as u64;
+                        total_destroy_entities += delta.destroys.len() as u64;
+                        total_update_entities += delta.updates.len() as u64;
+                        for create in &delta.creates {
+                            total_create_components += create.components.len() as u64;
+                            for component in &create.components {
+                                total_create_fields += component.fields.len() as u64;
+                            }
+                        }
+                        for update in &delta.updates {
+                            total_update_components += update.components.len() as u64;
+                            for component in &update.components {
+                                total_update_fields += component.fields.len() as u64;
+                            }
+                        }
+                    }
                     if tick == 1 {
                         let len = encode_full_snapshot_retry(
                             schema.schema(),
@@ -643,6 +681,8 @@ fn main() -> Result<()> {
         server_world.clear_trackers();
     }
 
+    let denom = (cli.ticks as u64).saturating_mul(clients as u64);
+    let denom_f64 = if denom == 0 { 1.0 } else { denom as f64 };
     let summary = Summary {
         mode: cli.mode,
         scenario: cli.scenario,
@@ -663,6 +703,20 @@ fn main() -> Result<()> {
         errors,
         resyncs,
         validation_errors,
+        total_create_entities,
+        total_create_components,
+        total_create_fields,
+        total_update_entities,
+        total_update_components,
+        total_update_fields,
+        total_destroy_entities,
+        avg_create_entities_per_client_tick: total_create_entities as f64 / denom_f64,
+        avg_create_components_per_client_tick: total_create_components as f64 / denom_f64,
+        avg_create_fields_per_client_tick: total_create_fields as f64 / denom_f64,
+        avg_update_entities_per_client_tick: total_update_entities as f64 / denom_f64,
+        avg_update_components_per_client_tick: total_update_components as f64 / denom_f64,
+        avg_update_fields_per_client_tick: total_update_fields as f64 / denom_f64,
+        avg_destroy_entities_per_client_tick: total_destroy_entities as f64 / denom_f64,
     };
 
     let out_path = cli.out_dir.join("summary.json");
