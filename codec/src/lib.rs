@@ -29,11 +29,12 @@ mod types;
 pub use baseline::{BaselineError, BaselineStore};
 pub use delta::{
     apply_delta_snapshot, apply_delta_snapshot_from_packet, decode_delta_packet,
-    encode_delta_snapshot, encode_delta_snapshot_for_client,
+    encode_delta_from_changes, encode_delta_snapshot, encode_delta_snapshot_for_client,
     encode_delta_snapshot_for_client_session,
     encode_delta_snapshot_for_client_session_with_scratch,
-    encode_delta_snapshot_for_client_with_scratch, encode_delta_snapshot_with_scratch,
-    select_baseline_tick, DeltaDecoded, DeltaUpdateComponent, DeltaUpdateEntity,
+    encode_delta_snapshot_for_client_with_scratch, encode_delta_snapshot_from_updates,
+    encode_delta_snapshot_with_scratch, select_baseline_tick, DeltaDecoded, DeltaUpdateComponent,
+    DeltaUpdateEntity, SessionEncoder,
 };
 pub use error::{CodecError, CodecResult, LimitKind, MaskKind, MaskReason, ValueReason};
 pub use limits::CodecLimits;

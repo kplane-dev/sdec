@@ -28,6 +28,8 @@ pub fn select_baseline_tick<T>(
 
 /// Encodes a delta snapshot into the provided output buffer.
 ///
+/// This is the scan-based path and is kept as a convenience/fallback. For
+/// production engines with dirty/change lists, prefer `encode_delta_from_changes`.
 /// Baseline and current snapshots must have entities sorted by `EntityId`.
 pub fn encode_delta_snapshot(
     schema: &schema::Schema,
@@ -100,6 +102,107 @@ pub fn encode_delta_snapshot_for_client(
         &mut scratch,
         out,
     )
+}
+
+/// Encoder context for delta packets that use caller-provided change lists.
+///
+/// This avoids scanning baseline/current snapshots and is preferred for
+/// production engines that already track dirty state.
+pub struct SessionEncoder<'a> {
+    schema: &'a schema::Schema,
+    limits: &'a CodecLimits,
+    #[allow(dead_code)]
+    scratch: CodecScratch,
+}
+
+impl<'a> SessionEncoder<'a> {
+    #[must_use]
+    pub fn new(schema: &'a schema::Schema, limits: &'a CodecLimits) -> Self {
+        Self {
+            schema,
+            limits,
+            scratch: CodecScratch::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn schema(&self) -> &'a schema::Schema {
+        self.schema
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> &'a CodecLimits {
+        self.limits
+    }
+}
+
+/// Encodes a delta snapshot from precomputed change lists.
+///
+/// Preferred for production engines (dirty/change-list driven). The scan-based
+/// encode paths remain as a convenience/fallback.
+pub fn encode_delta_from_changes(
+    session: &mut SessionEncoder<'_>,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    creates: &[EntitySnapshot],
+    destroys: &[EntityId],
+    updates: &[DeltaUpdateEntity],
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    encode_delta_snapshot_from_updates(
+        session.schema,
+        tick,
+        baseline_tick,
+        destroys,
+        creates,
+        updates,
+        session.limits,
+        out,
+    )
+}
+
+/// Encodes a delta snapshot using precomputed change lists.
+///
+/// This is a lower-level helper. Prefer `encode_delta_from_changes` with a
+/// `SessionEncoder` for production use.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_delta_snapshot_from_updates(
+    schema: &schema::Schema,
+    tick: SnapshotTick,
+    baseline_tick: SnapshotTick,
+    destroys: &[EntityId],
+    creates: &[EntitySnapshot],
+    updates: &[DeltaUpdateEntity],
+    limits: &CodecLimits,
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    if out.len() < wire::HEADER_SIZE {
+        return Err(CodecError::OutputTooSmall {
+            needed: wire::HEADER_SIZE,
+            available: out.len(),
+        });
+    }
+    let payload_len = encode_delta_payload_from_updates(
+        schema,
+        destroys,
+        creates,
+        updates,
+        limits,
+        &mut out[wire::HEADER_SIZE..],
+    )?;
+    let header = wire::PacketHeader::delta_snapshot(
+        schema_hash(schema),
+        tick.raw(),
+        baseline_tick.raw(),
+        payload_len as u32,
+    );
+    encode_header(&header, &mut out[..wire::HEADER_SIZE]).map_err(|_| {
+        CodecError::OutputTooSmall {
+            needed: wire::HEADER_SIZE,
+            available: out.len(),
+        }
+    })?;
+    Ok(wire::HEADER_SIZE + payload_len)
 }
 
 /// Encodes a client delta snapshot using a compact session header.
@@ -369,6 +472,73 @@ fn encode_delta_payload_with_mode(
                     ),
                 },
             )?;
+        offset += written;
+    }
+
+    Ok(offset)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_delta_payload_from_updates(
+    schema: &schema::Schema,
+    destroys: &[EntityId],
+    creates: &[EntitySnapshot],
+    updates: &[DeltaUpdateEntity],
+    limits: &CodecLimits,
+    out: &mut [u8],
+) -> CodecResult<usize> {
+    if destroys.len() > limits.max_entities_destroy {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesDestroy,
+            limit: limits.max_entities_destroy,
+            actual: destroys.len(),
+        });
+    }
+    if creates.len() > limits.max_entities_create {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesCreate,
+            limit: limits.max_entities_create,
+            actual: creates.len(),
+        });
+    }
+    if updates.len() > limits.max_entities_update {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: limits.max_entities_update,
+            actual: updates.len(),
+        });
+    }
+
+    ensure_entity_ids_sorted(destroys)?;
+    ensure_entities_sorted(creates)?;
+    validate_updates_for_encoding(schema, updates, limits)?;
+
+    let mut offset = 0;
+    if !destroys.is_empty() {
+        let written = write_section(
+            SectionTag::EntityDestroy,
+            &mut out[offset..],
+            limits,
+            |writer| encode_destroy_body_from_list(destroys, limits, writer),
+        )?;
+        offset += written;
+    }
+    if !creates.is_empty() {
+        let written = write_section(
+            SectionTag::EntityCreate,
+            &mut out[offset..],
+            limits,
+            |writer| encode_create_body_from_list(schema, creates, limits, writer),
+        )?;
+        offset += written;
+    }
+    if !updates.is_empty() {
+        let written = write_section(
+            SectionTag::EntityUpdateSparsePacked,
+            &mut out[offset..],
+            limits,
+            |writer| encode_update_body_sparse_packed_from_updates(schema, updates, limits, writer),
+        )?;
         offset += written;
     }
 
@@ -650,6 +820,199 @@ fn varu32_len(value: u32) -> usize {
     } else {
         5
     }
+}
+
+fn ensure_entity_ids_sorted(ids: &[EntityId]) -> CodecResult<()> {
+    let mut prev: Option<u32> = None;
+    for id in ids {
+        let raw = id.raw();
+        if let Some(prev_id) = prev {
+            if raw <= prev_id {
+                return Err(CodecError::InvalidEntityOrder {
+                    previous: prev_id,
+                    current: raw,
+                });
+            }
+        }
+        prev = Some(raw);
+    }
+    Ok(())
+}
+
+fn encode_destroy_body_from_list(
+    destroys: &[EntityId],
+    limits: &CodecLimits,
+    writer: &mut BitWriter<'_>,
+) -> CodecResult<()> {
+    if destroys.len() > limits.max_entities_destroy {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesDestroy,
+            limit: limits.max_entities_destroy,
+            actual: destroys.len(),
+        });
+    }
+    writer.align_to_byte()?;
+    writer.write_varu32(destroys.len() as u32)?;
+    for id in destroys {
+        writer.align_to_byte()?;
+        writer.write_u32_aligned(id.raw())?;
+    }
+    writer.align_to_byte()?;
+    Ok(())
+}
+
+fn encode_create_body_from_list(
+    schema: &schema::Schema,
+    creates: &[EntitySnapshot],
+    limits: &CodecLimits,
+    writer: &mut BitWriter<'_>,
+) -> CodecResult<()> {
+    if creates.len() > limits.max_entities_create {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesCreate,
+            limit: limits.max_entities_create,
+            actual: creates.len(),
+        });
+    }
+    writer.align_to_byte()?;
+    writer.write_varu32(creates.len() as u32)?;
+    for entity in creates {
+        write_create_entity(schema, entity, limits, writer)?;
+    }
+    writer.align_to_byte()?;
+    Ok(())
+}
+
+fn validate_updates_for_encoding(
+    schema: &schema::Schema,
+    updates: &[DeltaUpdateEntity],
+    limits: &CodecLimits,
+) -> CodecResult<()> {
+    let mut prev: Option<u32> = None;
+    for entity_update in updates {
+        let id = entity_update.id.raw();
+        if let Some(prev_id) = prev {
+            if id <= prev_id {
+                return Err(CodecError::InvalidEntityOrder {
+                    previous: prev_id,
+                    current: id,
+                });
+            }
+        }
+        prev = Some(id);
+        if entity_update.components.len() > limits.max_components_per_entity {
+            return Err(CodecError::LimitsExceeded {
+                kind: LimitKind::ComponentsPerEntity,
+                limit: limits.max_components_per_entity,
+                actual: entity_update.components.len(),
+            });
+        }
+        for component_update in &entity_update.components {
+            let component = schema
+                .components
+                .iter()
+                .find(|component| component.id == component_update.id)
+                .ok_or(CodecError::InvalidMask {
+                    kind: MaskKind::ComponentMask,
+                    reason: MaskReason::UnknownComponent {
+                        component: component_update.id,
+                    },
+                })?;
+            if component_update.fields.is_empty() {
+                return Err(CodecError::InvalidMask {
+                    kind: MaskKind::FieldMask {
+                        component: component_update.id,
+                    },
+                    reason: MaskReason::EmptyFieldMask {
+                        component: component_update.id,
+                    },
+                });
+            }
+            if component_update.fields.len() > limits.max_fields_per_component {
+                return Err(CodecError::LimitsExceeded {
+                    kind: LimitKind::FieldsPerComponent,
+                    limit: limits.max_fields_per_component,
+                    actual: component_update.fields.len(),
+                });
+            }
+            let max_index = component.fields.len().saturating_sub(1);
+            for (field_idx, _value) in &component_update.fields {
+                if *field_idx >= component.fields.len() {
+                    return Err(CodecError::InvalidMask {
+                        kind: MaskKind::FieldMask {
+                            component: component_update.id,
+                        },
+                        reason: MaskReason::InvalidFieldIndex {
+                            field_index: *field_idx,
+                            max: max_index,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_update_body_sparse_packed_from_updates(
+    schema: &schema::Schema,
+    updates: &[DeltaUpdateEntity],
+    limits: &CodecLimits,
+    writer: &mut BitWriter<'_>,
+) -> CodecResult<()> {
+    if updates.len() > limits.max_entities_update {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: limits.max_entities_update,
+            actual: updates.len(),
+        });
+    }
+    let entry_count: usize = updates.iter().map(|entity| entity.components.len()).sum();
+    let entry_limit = limits
+        .max_entities_update
+        .saturating_mul(limits.max_components_per_entity);
+    if entry_count > entry_limit {
+        return Err(CodecError::LimitsExceeded {
+            kind: LimitKind::EntitiesUpdate,
+            limit: entry_limit,
+            actual: entry_count,
+        });
+    }
+    writer.align_to_byte()?;
+    writer.write_varu32(entry_count as u32)?;
+    for entity_update in updates {
+        let entity_id = entity_update.id.raw();
+        for component_update in &entity_update.components {
+            let component = schema
+                .components
+                .iter()
+                .find(|component| component.id == component_update.id)
+                .ok_or(CodecError::InvalidMask {
+                    kind: MaskKind::ComponentMask,
+                    reason: MaskReason::UnknownComponent {
+                        component: component_update.id,
+                    },
+                })?;
+            writer.align_to_byte()?;
+            writer.write_varu32(entity_id)?;
+            writer.write_varu32(component.id.get() as u32)?;
+            writer.write_varu32(component_update.fields.len() as u32)?;
+            let index_bits = required_bits(component.fields.len().saturating_sub(1) as u64);
+            for (field_idx, value) in &component_update.fields {
+                if index_bits > 0 {
+                    writer.write_bits(*field_idx as u64, index_bits)?;
+                }
+                write_field_value_sparse(
+                    component.id,
+                    component.fields[*field_idx],
+                    *value,
+                    writer,
+                )?;
+            }
+        }
+    }
+    writer.align_to_byte()?;
+    Ok(())
 }
 
 fn encode_destroy_body(
