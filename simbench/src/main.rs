@@ -6,8 +6,9 @@ use anyhow::{Context, Result};
 use bitstream::BitVecWriter;
 use clap::{Parser, ValueEnum};
 use codec::{
-    encode_delta_snapshot_for_client_session_with_scratch, encode_delta_snapshot_with_scratch,
-    encode_full_snapshot, CodecLimits, CodecScratch,
+    encode_delta_snapshot_for_client_session_with_scratch, encode_delta_snapshot_from_updates,
+    encode_delta_snapshot_with_scratch, encode_full_snapshot, CodecLimits, CodecScratch,
+    DeltaUpdateComponent, DeltaUpdateEntity,
 };
 use serde::Serialize;
 use wire::Limits as WireLimits;
@@ -105,6 +106,7 @@ fn main() -> Result<()> {
     let mut scratch = CodecScratch::default();
 
     let mut sdec = EncoderStats::default();
+    let mut sdec_dirty = EncoderStats::default();
     let mut naive = EncoderStats::default();
     let mut full_bincode_bytes_total = 0u64;
     let mut full_bytes_total = 0u64;
@@ -147,6 +149,18 @@ fn main() -> Result<()> {
             let elapsed = start.elapsed();
             let sdec_us = elapsed.as_micros() as u64;
             sdec.add_with_tick(delta_bytes.len() as u64, sdec_us, tick);
+            let dirty_updates = build_dirty_updates(&schema, &baseline_snapshot, &snapshot)?;
+            let dirty_start = Instant::now();
+            let dirty_bytes = encode_delta_from_updates(
+                &schema,
+                snapshot.tick,
+                baseline_snapshot.tick,
+                &dirty_updates,
+                &limits,
+            )?;
+            let dirty_elapsed = dirty_start.elapsed();
+            let dirty_us = dirty_elapsed.as_micros() as u64;
+            sdec_dirty.add_with_tick(dirty_bytes.len() as u64, dirty_us, tick);
             let naive_start = Instant::now();
             let naive_bytes = encode_naive_delta(&schema, &baseline_snapshot, &snapshot)?;
             let naive_elapsed = naive_start.elapsed();
@@ -202,6 +216,7 @@ fn main() -> Result<()> {
         full_bytes_total,
         full_bincode_bytes_total,
         sdec,
+        sdec_dirty,
         naive,
         per_client_stats,
     );
@@ -261,6 +276,29 @@ fn encode_delta_with_scratch(
         &mut buf,
     )
     .context("encode delta snapshot")?;
+    buf.truncate(bytes);
+    Ok(buf)
+}
+
+fn encode_delta_from_updates(
+    schema: &schema::Schema,
+    tick: codec::SnapshotTick,
+    baseline_tick: codec::SnapshotTick,
+    updates: &[DeltaUpdateEntity],
+    limits: &CodecLimits,
+) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; limits.max_section_bytes.max(wire::HEADER_SIZE) * 4];
+    let bytes = encode_delta_snapshot_from_updates(
+        schema,
+        tick,
+        baseline_tick,
+        &[],
+        &[],
+        updates,
+        limits,
+        &mut buf,
+    )
+    .context("encode delta from updates")?;
     buf.truncate(bytes);
     Ok(buf)
 }
@@ -872,6 +910,81 @@ fn is_burst_tick(cli: &Cli, tick: u32) -> bool {
         .is_some_and(|every| every > 0 && tick % every == 0)
 }
 
+fn build_dirty_updates(
+    schema: &schema::Schema,
+    baseline: &codec::Snapshot,
+    current: &codec::Snapshot,
+) -> Result<Vec<DeltaUpdateEntity>> {
+    let mut updates = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < baseline.entities.len() || j < current.entities.len() {
+        let base = baseline.entities.get(i);
+        let curr = current.entities.get(j);
+        match (base, curr) {
+            (Some(b), Some(c)) => {
+                if b.id.raw() < c.id.raw() {
+                    anyhow::bail!("baseline destroy not supported in dirty list path");
+                } else if b.id.raw() > c.id.raw() {
+                    anyhow::bail!("baseline create not supported in dirty list path");
+                } else {
+                    let mut component_updates = Vec::new();
+                    for component in &schema.components {
+                        let base_component = find_component(b, component.id);
+                        let curr_component = find_component(c, component.id);
+                        if base_component.is_some() != curr_component.is_some() {
+                            anyhow::bail!("component presence mismatch for {:?}", component.id);
+                        }
+                        if let (Some(base_component), Some(curr_component)) =
+                            (base_component, curr_component)
+                        {
+                            let mut field_updates = Vec::new();
+                            for (idx, (base_value, curr_value)) in base_component
+                                .fields
+                                .iter()
+                                .zip(curr_component.fields.iter())
+                                .enumerate()
+                            {
+                                if base_value != curr_value {
+                                    field_updates.push((idx, *curr_value));
+                                }
+                            }
+                            if !field_updates.is_empty() {
+                                component_updates.push(DeltaUpdateComponent {
+                                    id: component.id,
+                                    fields: field_updates,
+                                });
+                            }
+                        }
+                    }
+                    if !component_updates.is_empty() {
+                        updates.push(DeltaUpdateEntity {
+                            id: c.id,
+                            components: component_updates,
+                        });
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+            (Some(_), None) => anyhow::bail!("baseline destroy not supported in dirty list path"),
+            (None, Some(_)) => anyhow::bail!("baseline create not supported in dirty list path"),
+            (None, None) => break,
+        }
+    }
+    Ok(updates)
+}
+
+fn find_component<'a>(
+    entity: &'a codec::EntitySnapshot,
+    id: schema::ComponentId,
+) -> Option<&'a codec::ComponentSnapshot> {
+    entity
+        .components
+        .iter()
+        .find(|component| component.id == id)
+}
+
 #[derive(Default)]
 struct EncoderStats {
     sizes: Vec<u64>,
@@ -965,6 +1078,7 @@ impl PerClientStats {
 struct Summary {
     scenario: ScenarioConfig,
     sdec: EncoderSummary,
+    sdec_dirty: EncoderSummary,
     delta_naive: EncoderSummary,
     full_bincode: FullSummary,
     per_client: Option<PerClientSummary>,
@@ -977,10 +1091,12 @@ impl Summary {
         full_bytes_total: u64,
         full_bincode_bytes_total: u64,
         mut sdec: EncoderStats,
+        mut sdec_dirty: EncoderStats,
         mut naive: EncoderStats,
         per_client_stats: Option<PerClientStats>,
     ) -> Self {
         let sdec_summary = sdec.finalize();
+        let sdec_dirty_summary = sdec_dirty.finalize();
         let naive_summary = naive.finalize();
         let avg_full = if cli.ticks > 0 {
             full_bytes_total / cli.ticks as u64
@@ -1007,6 +1123,7 @@ impl Summary {
         Summary {
             scenario: ScenarioConfig::from(cli),
             sdec: sdec_summary,
+            sdec_dirty: sdec_dirty_summary,
             delta_naive: naive_summary,
             full_bincode: FullSummary {
                 full_count,
