@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::{decode_packet_json, format_decode_pretty, inspect_packet};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use glob::Pattern;
-use crate::{decode_packet_json, format_decode_pretty, inspect_packet};
 
 #[derive(Parser)]
 #[command(
