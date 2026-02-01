@@ -180,6 +180,7 @@ struct Summary {
     apply_us_avg: u64,
     apply_us_p95: u64,
     errors: u64,
+    resyncs: u64,
 }
 
 struct ClientState {
@@ -245,6 +246,7 @@ fn main() -> Result<()> {
     let mut enc_times = Vec::new();
     let mut apply_times = Vec::new();
     let mut errors = 0u64;
+    let mut resyncs = 0u64;
 
     let mut sdec_limits = codec::CodecLimits::default();
     let entity_count = cli.entities as usize;
@@ -420,11 +422,30 @@ fn main() -> Result<()> {
                 if apply_result.is_err() {
                     errors += 1;
                     client_state.errors += 1;
+                    if matches!(cli.mode, Mode::Sdec) {
+                        if let Ok(resynced) = resync_client(
+                            &schema,
+                            &mut server_world,
+                            &mut server_entities,
+                            &mut client_state.world,
+                            &mut client_state.entities,
+                            &mut client_state.session,
+                            &visible_ids,
+                            &sdec_limits,
+                        ) {
+                            if resynced {
+                                resyncs += 1;
+                            }
+                        }
+                    }
                 } else {
                     apply_times.push(apply_start.elapsed());
                 }
             }
         }
+
+        // Advance Bevy change detection so Changed/Added/Removed are per-tick.
+        server_world.clear_trackers();
     }
 
     let summary = Summary {
@@ -445,6 +466,7 @@ fn main() -> Result<()> {
         apply_us_avg: avg_duration_us(&apply_times),
         apply_us_p95: p95_duration_us(&mut apply_times.clone()),
         errors,
+        resyncs,
     };
 
     let out_path = cli.out_dir.join("summary.json");
@@ -603,6 +625,31 @@ fn apply_sdec_packet(
         &decoded.updates,
     )?;
     Ok(())
+}
+
+fn resync_client(
+    schema: &sdec_bevy::BevySchema,
+    server_world: &mut World,
+    server_entities: &mut EntityMap,
+    client_world: &mut World,
+    client_entities: &mut EntityMap,
+    session: &mut Option<codec::SessionState>,
+    visible_ids: &HashSet<codec::EntityId>,
+    limits: &codec::CodecLimits,
+) -> Result<bool> {
+    let snapshot = build_sdec_snapshot_for_ids(schema, server_world, server_entities, visible_ids);
+    if snapshot.is_empty() {
+        return Ok(false);
+    }
+    let buf = encode_full_snapshot_retry(
+        schema.schema(),
+        SnapshotTick::new(session.as_ref().map(|s| s.last_tick.raw()).unwrap_or(0) + 1),
+        &snapshot,
+        limits,
+        256 * 1024,
+    )?;
+    apply_sdec_packet(schema, client_world, client_entities, session, limits, &buf)?;
+    Ok(true)
 }
 
 fn encode_full_snapshot_retry(
