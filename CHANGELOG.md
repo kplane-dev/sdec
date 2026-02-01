@@ -41,6 +41,15 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.6.1] - 2026-01-31
+
+### Added
+- Session fuzz target and chaos tests for session ordering/baseline handling.
+- CI smoke fuzz run for `session_packet` on nightly.
+
+### Changed
+- Bump workspace and internal crate versions to 0.6.1.
+
 ## [0.6.0] - 2026-01-31
 
 ### Added
