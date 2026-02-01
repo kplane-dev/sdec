@@ -105,6 +105,26 @@ pub enum CodecError {
     SessionOutOfOrder { previous: u32, current: u32 },
 }
 
+impl CodecError {
+    /// Returns `true` if the error indicates the client should resync via a
+    /// session init + full snapshot.
+    #[must_use]
+    pub fn needs_resync(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionMissing
+                | Self::SessionInitInvalid
+                | Self::SessionUnsupportedMode { .. }
+                | Self::SessionOutOfOrder { .. }
+                | Self::SchemaMismatch { .. }
+                | Self::BaselineNotFound { .. }
+                | Self::BaselineTickMismatch { .. }
+                | Self::Wire(wire::DecodeError::InvalidBaselineTick { .. })
+                | Self::Wire(wire::DecodeError::InvalidFlags { .. })
+        )
+    }
+}
+
 /// Specific limit that was exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitKind {

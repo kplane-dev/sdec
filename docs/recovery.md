@@ -3,6 +3,12 @@
 This document describes how to recover when session or baseline expectations
 are violated. The goal is explicit recovery signals and bounded errors.
 
+## Recommended lifecycle
+
+1) Client connects → server sends session init + full snapshot.
+2) Server sends compact deltas in steady-state.
+3) If the client reports a resync error, server re-sends full snapshot.
+
 ## Session missing or mismatched
 
 Symptoms:
@@ -35,6 +41,12 @@ reordered:
 
 - Late packets should be ignored.
 - Missing baselines should trigger a full snapshot + session recovery.
+
+## Resync signals
+
+The codec exposes a helper to decide when a resync is needed:
+
+- `CodecError::needs_resync()` returns `true` for session/baseline/tick errors.
 
 ## Safety guarantees
 

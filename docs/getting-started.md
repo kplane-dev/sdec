@@ -35,6 +35,7 @@ Use session mode when:
    - Client must ACK the session before accepting compact deltas.
 
 3) **Send a full snapshot** for the first tick (baseline).
+   - Full snapshots are for **initial sync and recovery**, not steady-state.
 
 4) **Send compact delta snapshots** per client:
    - Use packed sparse indices for updates.
