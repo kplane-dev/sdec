@@ -22,6 +22,7 @@ bitcode = "0.6.9"
 clap = { version = "4.5.2", features = ["derive"] }
 bitstream.workspace = true
 codec.workspace = true
+repgraph.workspace = true
 schema.workspace = true
 sdec-bevy = { path = "../sdec-bevy", version = "0.7.1" }
 serde = { workspace = true, features = ["derive"] }
