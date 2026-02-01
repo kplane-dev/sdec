@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::{decode_packet_json, format_decode_pretty, inspect_packet};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use glob::Pattern;
+use sdec_tools::{decode_packet_json, format_decode_pretty, inspect_packet, InspectReport};
 
 #[derive(Parser)]
 #[command(
@@ -191,7 +191,7 @@ fn maybe_sort_entries(
     entries
 }
 
-fn print_inspect_report(report: &crate::InspectReport) {
+fn print_inspect_report(report: &InspectReport) {
     let header = report.header;
     println!(
         "version: {} flags: 0x{:04x} schema_hash: 0x{:016x}",
