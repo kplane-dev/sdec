@@ -24,7 +24,7 @@ struct Cli {
     /// RNG seed for deterministic results.
     #[arg(long, default_value_t = 1)]
     seed: u64,
-    /// Replication mode (sdec, naive, or lightyear).
+    /// Replication mode (sdec, naive, or lightyear bitcode snapshot baseline).
     #[arg(long, value_enum, default_value_t = Mode::Sdec)]
     mode: Mode,
     /// Output directory for summary.json.
