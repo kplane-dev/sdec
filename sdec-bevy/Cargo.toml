@@ -1,0 +1,21 @@
+[package]
+name = "sdec-bevy"
+description = "Bevy adapter for sdec schema + delta encoding"
+readme = "../README.md"
+keywords = ["bevy", "replication", "delta", "snapshot", "netcode"]
+categories = ["game-development", "network-programming", "encoding"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sdec_bevy"
+
+[dependencies]
+anyhow = "1.0"
+bevy_ecs = "0.13"
+codec.workspace = true
+schema.workspace = true
+wire.workspace = true

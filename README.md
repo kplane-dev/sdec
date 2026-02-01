@@ -48,6 +48,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](W
 | `schema` | Replication schema model and field codecs |
 | `codec` | Snapshot/delta encoding and decoding |
 | `repgraph` | Replication graph + interest management |
+| `sdec-bevy` | Bevy ECS adapter for schema/extract/apply |
 | `tools` | Introspection and debugging utilities |
 | `simbench` | Scenario generation and benchmarking |
 

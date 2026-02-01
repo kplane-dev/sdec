@@ -6,6 +6,8 @@ members = [
     "schema",
     "codec",
     "repgraph",
+    "sdec-bevy",
+    "sdec-bevy-demo",
     "tools",
     "demo-schema",
     "demo-sim",

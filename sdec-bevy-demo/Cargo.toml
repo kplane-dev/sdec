@@ -1,0 +1,29 @@
+[package]
+name = "sdec-bevy-demo"
+description = "Bevy ECS demo harness for sdec"
+readme = "../README.md"
+keywords = ["bevy", "replication", "demo", "delta", "snapshot"]
+categories = ["game-development", "network-programming", "encoding"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sdec-bevy-demo"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+bevy_ecs = "0.13"
+bincode = "1.3"
+bitcode = "0.6.9"
+clap = { version = "4.5.2", features = ["derive"] }
+bitstream.workspace = true
+codec.workspace = true
+schema.workspace = true
+sdec-bevy = { path = "../sdec-bevy", version = "0.7.1" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0"
+wire.workspace = true
