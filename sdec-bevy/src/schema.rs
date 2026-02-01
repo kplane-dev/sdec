@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use anyhow::{anyhow, Result};
 use bevy_ecs::prelude::{Component, Entity, World};
-use codec::{ComponentSnapshot, DeltaUpdateComponent, FieldValue};
+use codec::{ComponentSnapshot, DeltaUpdateComponent, DeltaUpdateEntity, FieldValue};
 use schema::{ChangePolicy, ComponentDef, ComponentId, FieldCodec, FieldDef, FieldId, Schema};
 
 #[derive(Debug, Clone)]
@@ -219,6 +219,30 @@ impl BevySchema {
             .adapter_by_component(component_id)
             .ok_or_else(|| anyhow!("unknown component {:?}", component_id))?;
         adapter.insert_component(world, entity, fields)
+    }
+
+    pub fn build_delta_update(
+        &self,
+        world: &World,
+        entity: Entity,
+        entity_id: codec::EntityId,
+        component_ids: &[ComponentId],
+    ) -> Option<DeltaUpdateEntity> {
+        let mut components = Vec::new();
+        for component_id in component_ids {
+            let adapter = self.adapter_by_component(*component_id)?;
+            if let Some(update) = adapter.update_component(world, entity) {
+                components.push(update);
+            }
+        }
+        if components.is_empty() {
+            None
+        } else {
+            Some(DeltaUpdateEntity {
+                id: entity_id,
+                components,
+            })
+        }
     }
 }
 
