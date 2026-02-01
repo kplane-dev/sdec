@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use glob::Pattern;
-use tools::{decode_packet_json, format_decode_pretty, inspect_packet};
+use crate::{decode_packet_json, format_decode_pretty, inspect_packet};
 
 #[derive(Parser)]
 #[command(
@@ -191,7 +191,7 @@ fn maybe_sort_entries(
     entries
 }
 
-fn print_inspect_report(report: &tools::InspectReport) {
+fn print_inspect_report(report: &crate::InspectReport) {
     let header = report.header;
     println!(
         "version: {} flags: 0x{:04x} schema_hash: 0x{:016x}",
