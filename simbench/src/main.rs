@@ -157,12 +157,10 @@ fn main() -> Result<()> {
             &mut init_buf,
         )?;
         sdec_session_init_bytes = init_len as u64;
-        let init_packet =
-            wire::decode_packet(&init_buf[..init_len], &wire::Limits::default())
-                .context("decode session init")?;
-        let session =
-            codec::decode_session_init_packet(&schema, &init_packet, &limits)
-                .context("decode session init packet")?;
+        let init_packet = wire::decode_packet(&init_buf[..init_len], &wire::Limits::default())
+            .context("decode session init")?;
+        let session = codec::decode_session_init_packet(&schema, &init_packet, &limits)
+            .context("decode session init packet")?;
         sdec_session_state = Some(session);
     }
 
@@ -186,11 +184,8 @@ fn main() -> Result<()> {
             full_bytes_total += full_bytes.len() as u64;
             full_count += 1;
             if let Some(session) = sdec_session_state.as_mut() {
-                let session_bytes = encode_full_snapshot_session_header(
-                    &snapshot,
-                    session,
-                    full_bytes.len(),
-                )?;
+                let session_bytes =
+                    encode_full_snapshot_session_header(&snapshot, session, full_bytes.len())?;
                 sdec_full_session.add(session_bytes as u64, full_elapsed.as_micros() as u64);
             }
         } else if tick == 1 {

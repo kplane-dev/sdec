@@ -540,11 +540,7 @@ fn encode_delta_payload_from_updates(
             limits,
             |writer| {
                 encode_update_body_sparse_packed_from_updates(
-                    schema,
-                    updates,
-                    limits,
-                    &lookup,
-                    writer,
+                    schema, updates, limits, &lookup, writer,
                 )
             },
         )?;
