@@ -143,7 +143,7 @@ fn main() -> Result<()> {
             commands.trigger(ly_server::Start {
                 entity: server_entity,
             });
-        });
+        })?;
 
     let now = Instant::now();
     server_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
@@ -171,7 +171,7 @@ fn main() -> Result<()> {
                 commands.trigger(LinkStart {
                     entity: server_link,
                 });
-            });
+            })?;
 
         let auth = Authentication::Manual {
             server_addr,
@@ -200,7 +200,7 @@ fn main() -> Result<()> {
                 commands.trigger(ly_client::Connect {
                     entity: client_entity,
                 });
-            });
+            })?;
         client_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
         client_apps.push(ClientHandle {
             app: client_app,
