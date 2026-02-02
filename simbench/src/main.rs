@@ -9,8 +9,12 @@ use codec::{
     encode_delta_from_changes, encode_delta_snapshot_with_scratch, encode_full_snapshot,
     CodecLimits, CodecScratch, DeltaUpdateComponent, DeltaUpdateEntity, SessionEncoder,
 };
+use lightyear_core::tick::Tick;
+use lightyear_replication::delta::{DeltaType, Diffable};
+use lightyear_serde::registry::SerializeFns;
+use lightyear_serde::writer::Writer;
 use repgraph::{ClientId, ClientView, ReplicationConfig, ReplicationGraph, Vec3, WorldView};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wire::Limits as WireLimits;
 
 #[derive(Parser)]
@@ -77,6 +81,9 @@ struct Cli {
     /// Fail if average delta packet size exceeds this value.
     #[arg(long)]
     max_avg_delta_bytes: Option<u64>,
+    /// Use full snapshots every tick (no deltas).
+    #[arg(long, default_value_t = false)]
+    full_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, PartialEq, Eq)]
@@ -116,7 +123,13 @@ fn main() -> Result<()> {
     let mut sdec = EncoderStats::default();
     let mut sdec_dirty = EncoderStats::default();
     let mut naive = EncoderStats::default();
-    let mut full_bincode_bytes_total = 0u64;
+    let mut bincode_full = SizeTimeStats::default();
+    let mut lightyear_bitcode = SizeTimeStats::default();
+    let mut lightyear_delta = EncoderStats::default();
+    let mut sdec_full_session = SizeTimeStats::default();
+    let mut sdec_session_init_bytes = 0u64;
+    let mut sdec_session_state: Option<codec::SessionState> = None;
+    let mut bincode_delta = EncoderStats::default();
     let mut full_bytes_total = 0u64;
     let mut full_count = 0u32;
 
@@ -133,13 +146,54 @@ fn main() -> Result<()> {
         };
     let mut client_baselines: Vec<codec::Snapshot> = Vec::new();
 
+    if cli.full_only {
+        let mut init_buf = vec![0u8; 128];
+        let init_len = codec::encode_session_init_packet(
+            &schema,
+            codec::SnapshotTick::new(0),
+            Some(1),
+            codec::CompactHeaderMode::SessionV1,
+            &limits,
+            &mut init_buf,
+        )?;
+        sdec_session_init_bytes = init_len as u64;
+        let init_packet =
+            wire::decode_packet(&init_buf[..init_len], &wire::Limits::default())
+                .context("decode session init")?;
+        let session =
+            codec::decode_session_init_packet(&schema, &init_packet, &limits)
+                .context("decode session init packet")?;
+        sdec_session_state = Some(session);
+    }
+
     for tick in 1..=cli.ticks {
         step_states(&mut states, &mut rng, tick, &cli);
         let snapshot = build_snapshot(codec::SnapshotTick::new(tick), &states);
 
-        full_bincode_bytes_total += encode_bincode_snapshot(&states)? as u64;
+        let bincode_start = Instant::now();
+        let bincode_bytes = encode_bincode_snapshot(&states)? as u64;
+        let bincode_us = bincode_start.elapsed().as_micros() as u64;
+        bincode_full.add(bincode_bytes, bincode_us);
+        let bitcode_start = Instant::now();
+        let bitcode_bytes = encode_bitcode_snapshot(&states)? as u64;
+        let bitcode_us = bitcode_start.elapsed().as_micros() as u64;
+        lightyear_bitcode.add(bitcode_bytes, bitcode_us);
 
-        if tick == 1 {
+        if cli.full_only {
+            let full_start = Instant::now();
+            let full_bytes = encode_full(&schema, &snapshot, &limits)?;
+            let full_elapsed = full_start.elapsed();
+            full_bytes_total += full_bytes.len() as u64;
+            full_count += 1;
+            if let Some(session) = sdec_session_state.as_mut() {
+                let session_bytes = encode_full_snapshot_session_header(
+                    &snapshot,
+                    session,
+                    full_bytes.len(),
+                )?;
+                sdec_full_session.add(session_bytes as u64, full_elapsed.as_micros() as u64);
+            }
+        } else if tick == 1 {
             let full_bytes = encode_full(&schema, &snapshot, &limits)?;
             full_bytes_total += full_bytes.len() as u64;
             full_count += 1;
@@ -172,6 +226,19 @@ fn main() -> Result<()> {
             let naive_elapsed = naive_start.elapsed();
             let naive_us = naive_elapsed.as_micros() as u64;
             naive.add_with_tick(naive_bytes as u64, naive_us, tick);
+            let bincode_delta_start = Instant::now();
+            let bincode_delta_bytes = encode_bincode_delta(&schema, &baseline_snapshot, &snapshot)?;
+            let bincode_delta_elapsed = bincode_delta_start.elapsed();
+            let bincode_delta_us = bincode_delta_elapsed.as_micros() as u64;
+            bincode_delta.add_with_tick(bincode_delta_bytes as u64, bincode_delta_us, tick);
+            if let Some(prev_states) = last_states.as_deref() {
+                let lightyear_start = Instant::now();
+                let lightyear_bytes =
+                    encode_lightyear_delta(prev_states, &states, tick.saturating_sub(1))?;
+                let lightyear_elapsed = lightyear_start.elapsed();
+                let lightyear_us = lightyear_elapsed.as_micros() as u64;
+                lightyear_delta.add_with_tick(lightyear_bytes as u64, lightyear_us, tick);
+            }
             if cli.debug_burst_ticks && burst_now {
                 println!(
                     "burst tick {}: sdec_us={} sdec_bytes={} naive_us={} naive_bytes={}",
@@ -226,9 +293,9 @@ fn main() -> Result<()> {
                 graph.clear_dirty();
                 graph.clear_removed();
             }
-            last_states = Some(states.clone());
         }
 
+        last_states = Some(states.clone());
         baseline_snapshot = snapshot;
     }
 
@@ -242,10 +309,15 @@ fn main() -> Result<()> {
         &cli,
         full_count,
         full_bytes_total,
-        full_bincode_bytes_total,
         sdec,
         sdec_dirty,
         naive,
+        bincode_delta,
+        bincode_full,
+        lightyear_bitcode,
+        lightyear_delta,
+        sdec_full_session,
+        sdec_session_init_bytes,
         per_client_stats,
     );
 
@@ -283,6 +355,36 @@ fn encode_full(
         .context("encode full snapshot")?;
     buf.truncate(bytes);
     Ok(buf)
+}
+
+fn encode_full_snapshot_session_header(
+    snapshot: &codec::Snapshot,
+    session: &mut codec::SessionState,
+    full_bytes_len: usize,
+) -> Result<usize> {
+    let payload_len = full_bytes_len.saturating_sub(wire::HEADER_SIZE);
+    let tick = snapshot.tick.raw();
+    let last_tick = session.last_tick.raw();
+    if tick <= last_tick {
+        anyhow::bail!(
+            "session header tick {} is not after last {}",
+            tick,
+            last_tick
+        );
+    }
+    let tick_delta = tick - last_tick;
+    let baseline_delta = tick;
+    let mut header_buf = [0u8; wire::SESSION_MAX_HEADER_SIZE];
+    let header_len = wire::encode_session_header(
+        &mut header_buf,
+        wire::SessionFlags::full_snapshot(),
+        tick_delta,
+        baseline_delta,
+        payload_len as u32,
+    )
+    .context("encode session header")?;
+    session.last_tick = snapshot.tick;
+    Ok(header_len + payload_len)
 }
 
 fn encode_delta_with_scratch(
@@ -362,6 +464,66 @@ impl ClientBreakdown {
     }
 }
 
+#[derive(Default)]
+struct SizeTimeStats {
+    sizes: Vec<u64>,
+    encode_us: Vec<u64>,
+    total_bytes: u64,
+    count: u32,
+}
+
+impl SizeTimeStats {
+    fn add(&mut self, bytes: u64, encode_us: u64) {
+        self.total_bytes += bytes;
+        self.count += 1;
+        self.sizes.push(bytes);
+        if encode_us > 0 {
+            self.encode_us.push(encode_us);
+        }
+    }
+
+    fn finalize(&mut self) -> SizeTimeSummary {
+        let avg_bytes = if self.count > 0 {
+            self.total_bytes / self.count as u64
+        } else {
+            0
+        };
+        let p95_bytes = if self.sizes.is_empty() {
+            0
+        } else {
+            p95(&mut self.sizes)
+        };
+        let avg_encode = if self.encode_us.is_empty() {
+            0
+        } else {
+            self.encode_us.iter().sum::<u64>() / self.encode_us.len() as u64
+        };
+        let p95_encode = if self.encode_us.is_empty() {
+            0
+        } else {
+            p95(&mut self.encode_us)
+        };
+        SizeTimeSummary {
+            count: self.count,
+            bytes_total: self.total_bytes,
+            bytes_avg: avg_bytes,
+            bytes_p95: p95_bytes,
+            encode_us_avg: avg_encode,
+            encode_us_p95: p95_encode,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SizeTimeSummary {
+    count: u32,
+    bytes_total: u64,
+    bytes_avg: u64,
+    bytes_p95: u64,
+    encode_us_avg: u64,
+    encode_us_p95: u64,
+}
+
 fn encode_bincode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
     let snapshot = SerdeSnapshot {
         entities: states
@@ -377,6 +539,84 @@ fn encode_bincode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
     };
     let bytes = bincode::serialize(&snapshot).context("bincode snapshot")?;
     Ok(bytes.len())
+}
+
+fn encode_bitcode_snapshot(states: &[DemoEntityState]) -> Result<usize> {
+    let snapshot = SerdeSnapshot {
+        entities: states
+            .iter()
+            .map(|state| SerdeEntity {
+                id: state.id.raw(),
+                pos_q: state.pos_q,
+                vel_q: state.vel_q,
+                yaw: state.yaw,
+                flags: state.flags,
+            })
+            .collect(),
+    };
+    let bytes = bitcode::encode(&snapshot);
+    Ok(bytes.len())
+}
+
+fn encode_bincode_delta(
+    schema: &schema::Schema,
+    baseline: &codec::Snapshot,
+    current: &codec::Snapshot,
+) -> Result<usize> {
+    let mut entities = Vec::new();
+    for entity in &current.entities {
+        let base = baseline.entities.iter().find(|e| e.id == entity.id);
+        if let Some(base) = base {
+            let changed_fields = diff_entity_fields(schema, base, entity)?;
+            if !changed_fields.is_empty() {
+                let fields = changed_fields
+                    .into_iter()
+                    .map(|(idx, value)| SerdeDeltaField {
+                        idx: idx as u16,
+                        value: serde_field_value(value),
+                    })
+                    .collect();
+                entities.push(SerdeDeltaEntity {
+                    id: entity.id.raw(),
+                    fields,
+                });
+            }
+        }
+    }
+    let snapshot = SerdeDeltaSnapshot { entities };
+    let bytes = bincode::serialize(&snapshot).context("bincode delta")?;
+    Ok(bytes.len())
+}
+
+fn encode_lightyear_delta(
+    prev_states: &[DemoEntityState],
+    states: &[DemoEntityState],
+    prev_tick: u32,
+) -> Result<usize> {
+    if prev_states.len() != states.len() {
+        anyhow::bail!("lightyear delta requires matching state lengths");
+    }
+    let mut entities = Vec::new();
+    let previous_tick = Tick(prev_tick as u16);
+    for (prev, curr) in prev_states.iter().zip(states.iter()) {
+        let prev_state = LightyearState::from(prev);
+        let curr_state = LightyearState::from(curr);
+        let delta = prev_state.diff(&curr_state);
+        if delta.mask != 0 {
+            entities.push(LightyearDeltaEntity {
+                id: curr.id.raw(),
+                delta: LightyearDeltaMessage {
+                    delta_type: DeltaType::Normal { previous_tick },
+                    delta,
+                },
+            });
+        }
+    }
+    let snapshot = LightyearDeltaSnapshot { entities };
+    let mut writer = Writer::with_capacity(256);
+    let serializer = SerializeFns::<LightyearDeltaSnapshot>::default();
+    (serializer.serialize)(&snapshot, &mut writer).context("lightyear delta serialize")?;
+    Ok(writer.len())
 }
 
 fn encode_naive_delta(
@@ -1138,7 +1378,12 @@ struct Summary {
     sdec: EncoderSummary,
     sdec_dirty: EncoderSummary,
     delta_naive: EncoderSummary,
+    delta_bincode: EncoderSummary,
+    lightyear_delta: EncoderSummary,
+    sdec_full_session: SizeTimeSummary,
+    sdec_session_init_bytes: u64,
     full_bincode: FullSummary,
+    lightyear_bitcode: SizeTimeSummary,
     per_client: Option<PerClientSummary>,
 }
 
@@ -1148,22 +1393,32 @@ impl Summary {
         cli: &Cli,
         full_count: u32,
         full_bytes_total: u64,
-        full_bincode_bytes_total: u64,
         mut sdec: EncoderStats,
         mut sdec_dirty: EncoderStats,
         mut naive: EncoderStats,
+        mut bincode_delta: EncoderStats,
+        mut bincode_full: SizeTimeStats,
+        mut lightyear_bitcode: SizeTimeStats,
+        mut lightyear_delta: EncoderStats,
+        mut sdec_full_session: SizeTimeStats,
+        sdec_session_init_bytes: u64,
         per_client_stats: Option<PerClientStats>,
     ) -> Self {
         let sdec_summary = sdec.finalize();
         let sdec_dirty_summary = sdec_dirty.finalize();
         let naive_summary = naive.finalize();
+        let bincode_delta_summary = bincode_delta.finalize();
+        let bincode_full_summary = bincode_full.finalize();
+        let lightyear_bitcode_summary = lightyear_bitcode.finalize();
+        let lightyear_delta_summary = lightyear_delta.finalize();
+        let sdec_full_session_summary = sdec_full_session.finalize();
         let avg_full = if cli.ticks > 0 {
             full_bytes_total / cli.ticks as u64
         } else {
             0
         };
         let avg_bincode = if cli.ticks > 0 {
-            full_bincode_bytes_total / cli.ticks as u64
+            bincode_full_summary.bytes_total / cli.ticks as u64
         } else {
             0
         };
@@ -1184,13 +1439,21 @@ impl Summary {
             sdec: sdec_summary,
             sdec_dirty: sdec_dirty_summary,
             delta_naive: naive_summary,
+            delta_bincode: bincode_delta_summary,
+            lightyear_delta: lightyear_delta_summary,
+            sdec_full_session: sdec_full_session_summary,
+            sdec_session_init_bytes,
             full_bincode: FullSummary {
                 full_count,
                 full_bytes_total,
-                full_bincode_bytes_total,
+                full_bincode_bytes_total: bincode_full_summary.bytes_total,
                 avg_full_bytes: avg_full,
                 avg_full_bincode_bytes: avg_bincode,
+                full_bincode_p95_bytes: bincode_full_summary.bytes_p95,
+                full_bincode_encode_us_avg: bincode_full_summary.encode_us_avg,
+                full_bincode_encode_us_p95: bincode_full_summary.encode_us_p95,
             },
+            lightyear_bitcode: lightyear_bitcode_summary,
             per_client,
         }
     }
@@ -1272,6 +1535,9 @@ struct FullSummary {
     full_bincode_bytes_total: u64,
     avg_full_bytes: u64,
     avg_full_bincode_bytes: u64,
+    full_bincode_p95_bytes: u64,
+    full_bincode_encode_us_avg: u64,
+    full_bincode_encode_us_p95: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1310,16 +1576,214 @@ impl Rng {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 struct SerdeSnapshot {
     entities: Vec<SerdeEntity>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 struct SerdeEntity {
     id: u32,
     pos_q: [i64; 3],
     vel_q: [i64; 3],
     yaw: u16,
     flags: [bool; 3],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LightyearState {
+    pos_q: [i64; 3],
+    vel_q: [i64; 3],
+    yaw: u16,
+    flags: [bool; 3],
+}
+
+impl From<&DemoEntityState> for LightyearState {
+    fn from(state: &DemoEntityState) -> Self {
+        Self {
+            pos_q: state.pos_q,
+            vel_q: state.vel_q,
+            yaw: state.yaw,
+            flags: state.flags,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LightyearDeltaSnapshot {
+    entities: Vec<LightyearDeltaEntity>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LightyearDeltaEntity {
+    id: u32,
+    delta: LightyearDeltaMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LightyearDeltaMessage {
+    delta_type: DeltaType,
+    delta: LightyearDelta,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LightyearDelta {
+    mask: u16,
+    values: Vec<LightyearValue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum LightyearValue {
+    FixedPoint(i64),
+    UInt(u16),
+    Bool(bool),
+}
+
+impl Diffable<LightyearDelta> for LightyearState {
+    fn base_value() -> Self {
+        Self {
+            pos_q: [0; 3],
+            vel_q: [0; 3],
+            yaw: 0,
+            flags: [false; 3],
+        }
+    }
+
+    fn diff(&self, new: &Self) -> LightyearDelta {
+        let mut mask = 0u16;
+        let mut values = Vec::new();
+        if self.pos_q[0] != new.pos_q[0] {
+            mask |= 1 << 0;
+            values.push(LightyearValue::FixedPoint(new.pos_q[0]));
+        }
+        if self.pos_q[1] != new.pos_q[1] {
+            mask |= 1 << 1;
+            values.push(LightyearValue::FixedPoint(new.pos_q[1]));
+        }
+        if self.pos_q[2] != new.pos_q[2] {
+            mask |= 1 << 2;
+            values.push(LightyearValue::FixedPoint(new.pos_q[2]));
+        }
+        if self.vel_q[0] != new.vel_q[0] {
+            mask |= 1 << 3;
+            values.push(LightyearValue::FixedPoint(new.vel_q[0]));
+        }
+        if self.vel_q[1] != new.vel_q[1] {
+            mask |= 1 << 4;
+            values.push(LightyearValue::FixedPoint(new.vel_q[1]));
+        }
+        if self.vel_q[2] != new.vel_q[2] {
+            mask |= 1 << 5;
+            values.push(LightyearValue::FixedPoint(new.vel_q[2]));
+        }
+        if self.yaw != new.yaw {
+            mask |= 1 << 6;
+            values.push(LightyearValue::UInt(new.yaw));
+        }
+        if self.flags[0] != new.flags[0] {
+            mask |= 1 << 7;
+            values.push(LightyearValue::Bool(new.flags[0]));
+        }
+        if self.flags[1] != new.flags[1] {
+            mask |= 1 << 8;
+            values.push(LightyearValue::Bool(new.flags[1]));
+        }
+        if self.flags[2] != new.flags[2] {
+            mask |= 1 << 9;
+            values.push(LightyearValue::Bool(new.flags[2]));
+        }
+        LightyearDelta { mask, values }
+    }
+
+    fn apply_diff(&mut self, delta: &LightyearDelta) {
+        let mut values = delta.values.iter();
+        if delta.mask & (1 << 0) != 0 {
+            if let Some(LightyearValue::FixedPoint(value)) = values.next() {
+                self.pos_q[0] = *value;
+            }
+        }
+        if delta.mask & (1 << 1) != 0 {
+            if let Some(LightyearValue::FixedPoint(value)) = values.next() {
+                self.pos_q[1] = *value;
+            }
+        }
+        if delta.mask & (1 << 2) != 0 {
+            if let Some(LightyearValue::FixedPoint(value)) = values.next() {
+                self.pos_q[2] = *value;
+            }
+        }
+        if delta.mask & (1 << 3) != 0 {
+            if let Some(LightyearValue::FixedPoint(value)) = values.next() {
+                self.vel_q[0] = *value;
+            }
+        }
+        if delta.mask & (1 << 4) != 0 {
+            if let Some(LightyearValue::FixedPoint(value)) = values.next() {
+                self.vel_q[1] = *value;
+            }
+        }
+        if delta.mask & (1 << 5) != 0 {
+            if let Some(LightyearValue::FixedPoint(value)) = values.next() {
+                self.vel_q[2] = *value;
+            }
+        }
+        if delta.mask & (1 << 6) != 0 {
+            if let Some(LightyearValue::UInt(value)) = values.next() {
+                self.yaw = *value;
+            }
+        }
+        if delta.mask & (1 << 7) != 0 {
+            if let Some(LightyearValue::Bool(value)) = values.next() {
+                self.flags[0] = *value;
+            }
+        }
+        if delta.mask & (1 << 8) != 0 {
+            if let Some(LightyearValue::Bool(value)) = values.next() {
+                self.flags[1] = *value;
+            }
+        }
+        if delta.mask & (1 << 9) != 0 {
+            if let Some(LightyearValue::Bool(value)) = values.next() {
+                self.flags[2] = *value;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SerdeDeltaSnapshot {
+    entities: Vec<SerdeDeltaEntity>,
+}
+
+#[derive(Debug, Serialize)]
+struct SerdeDeltaEntity {
+    id: u32,
+    fields: Vec<SerdeDeltaField>,
+}
+
+#[derive(Debug, Serialize)]
+struct SerdeDeltaField {
+    idx: u16,
+    value: SerdeFieldValue,
+}
+
+#[derive(Debug, Serialize)]
+enum SerdeFieldValue {
+    Bool(bool),
+    UInt(u64),
+    SInt(i64),
+    VarUInt(u64),
+    VarSInt(i64),
+    FixedPoint(i64),
+}
+
+fn serde_field_value(value: codec::FieldValue) -> SerdeFieldValue {
+    match value {
+        codec::FieldValue::Bool(value) => SerdeFieldValue::Bool(value),
+        codec::FieldValue::UInt(value) => SerdeFieldValue::UInt(value),
+        codec::FieldValue::SInt(value) => SerdeFieldValue::SInt(value),
+        codec::FieldValue::VarUInt(value) => SerdeFieldValue::VarUInt(value),
+        codec::FieldValue::VarSInt(value) => SerdeFieldValue::VarSInt(value),
+        codec::FieldValue::FixedPoint(value) => SerdeFieldValue::FixedPoint(value),
+    }
 }
