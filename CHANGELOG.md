@@ -41,6 +41,17 @@ This project follows Semantic Versioning for pre-1.0 releases.
 ### Changed
 - Tools crate now includes structured inspect/decode report builders and tests.
 
+## [0.8.0] - 2026-02-01
+
+### Added
+- `sdec-bevy` publish support in the release workflow.
+- Extended `simbench` baselines (bincode delta, lightyear delta/bitcode) and full-only session header mode.
+- `sdec-bevy-demo` timing splits (replication/codec/header) and buffer reuse.
+
+### Changed
+- Faster delta encoding via component lookup caching.
+- Bump workspace and internal crate versions to 0.8.0.
+
 ## [0.7.1] - 2026-01-31
 
 ### Changed
