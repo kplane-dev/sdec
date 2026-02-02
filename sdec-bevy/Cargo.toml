@@ -1,9 +1,10 @@
 [package]
 name = "sdec-bevy"
 description = "Bevy adapter for sdec schema + delta encoding"
-readme = "../README.md"
+readme = "README.md"
 keywords = ["bevy", "replication", "delta", "snapshot", "netcode"]
 categories = ["game-development", "network-programming", "encoding"]
+documentation = "https://docs.rs/sdec-bevy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
