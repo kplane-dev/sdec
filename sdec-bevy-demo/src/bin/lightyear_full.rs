@@ -139,7 +139,7 @@ fn main() -> Result<()> {
         .id();
     server_app
         .world_mut()
-        .run_system_once(|mut commands: Commands| {
+        .run_system_once(move |mut commands: Commands| {
             commands.trigger(ly_server::Start {
                 entity: server_entity,
             });
@@ -167,7 +167,7 @@ fn main() -> Result<()> {
             .id();
         server_app
             .world_mut()
-            .run_system_once(|mut commands: Commands| {
+            .run_system_once(move |mut commands: Commands| {
                 commands.trigger(LinkStart {
                     entity: server_link,
                 });
@@ -193,7 +193,7 @@ fn main() -> Result<()> {
             .id();
         client_app
             .world_mut()
-            .run_system_once(|mut commands: Commands| {
+            .run_system_once(move |mut commands: Commands| {
                 commands.trigger(LinkStart {
                     entity: client_entity,
                 });
