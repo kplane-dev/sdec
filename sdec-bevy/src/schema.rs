@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use anyhow::{anyhow, Result};
+use bevy_ecs::component::Mutable;
 use bevy_ecs::prelude::{Component, Entity, World};
 use codec::{ComponentSnapshot, DeltaUpdateComponent, DeltaUpdateEntity, FieldValue};
 use schema::{ChangePolicy, ComponentDef, ComponentId, FieldCodec, FieldDef, FieldId, Schema};
@@ -14,7 +15,7 @@ pub struct ReplicatedField {
     pub change: Option<ChangePolicy>,
 }
 
-pub trait ReplicatedComponent: Component {
+pub trait ReplicatedComponent: Component<Mutability = Mutable> {
     const COMPONENT_ID: u16;
 
     fn fields() -> Vec<ReplicatedField>;
