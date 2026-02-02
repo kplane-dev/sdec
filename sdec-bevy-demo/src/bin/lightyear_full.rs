@@ -137,9 +137,13 @@ fn main() -> Result<()> {
         .world_mut()
         .spawn(ly_server::NetcodeServer::new(server_config))
         .id();
-    server_app.world_mut().run_system_once(|mut commands: Commands| {
-        commands.trigger(ly_server::Start { entity: server_entity });
-    });
+    server_app
+        .world_mut()
+        .run_system_once(|mut commands: Commands| {
+            commands.trigger(ly_server::Start {
+                entity: server_entity,
+            });
+        });
 
     let now = Instant::now();
     server_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
@@ -156,12 +160,18 @@ fn main() -> Result<()> {
             .world_mut()
             .spawn((
                 CrossbeamIo::new(s2c_raw_tx, c2s_rx),
-                ly_server::LinkOf { server: server_entity },
+                ly_server::LinkOf {
+                    server: server_entity,
+                },
             ))
             .id();
-        server_app.world_mut().run_system_once(|mut commands: Commands| {
-            commands.trigger(LinkStart { entity: server_link });
-        });
+        server_app
+            .world_mut()
+            .run_system_once(|mut commands: Commands| {
+                commands.trigger(LinkStart {
+                    entity: server_link,
+                });
+            });
 
         let auth = Authentication::Manual {
             server_addr,
@@ -179,15 +189,18 @@ fn main() -> Result<()> {
 
         let client_entity = client_app
             .world_mut()
-            .spawn((
-                netcode_client,
-                CrossbeamIo::new(c2s_raw_tx, s2c_rx),
-            ))
+            .spawn((netcode_client, CrossbeamIo::new(c2s_raw_tx, s2c_rx)))
             .id();
-        client_app.world_mut().run_system_once(|mut commands: Commands| {
-            commands.trigger(LinkStart { entity: client_entity });
-            commands.trigger(ly_client::Connect { entity: client_entity });
-        });
+        client_app
+            .world_mut()
+            .run_system_once(|mut commands: Commands| {
+                commands.trigger(LinkStart {
+                    entity: client_entity,
+                });
+                commands.trigger(ly_client::Connect {
+                    entity: client_entity,
+                });
+            });
         client_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
         client_apps.push(ClientHandle {
             app: client_app,
@@ -299,8 +312,7 @@ fn main() -> Result<()> {
             client_app.app.update();
             per_tick_client_time += start.elapsed();
             if let Some((server_count, server_hash)) = server_digest {
-                let (client_count, client_hash) =
-                    state_digest_client(client_app.app.world_mut());
+                let (client_count, client_hash) = state_digest_client(client_app.app.world_mut());
                 if client_count != server_count || client_hash != server_hash {
                     validation_errors += 1;
                 }
