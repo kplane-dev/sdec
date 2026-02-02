@@ -1,4 +1,5 @@
 use std::any::TypeId;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use anyhow::{anyhow, Result};
@@ -166,6 +167,7 @@ impl<T: ReplicatedComponent> ComponentAdapter for ComponentAdapterImpl<T> {
 pub struct BevySchema {
     pub schema: Schema,
     adapters: Vec<Box<dyn ComponentAdapter>>,
+    adapter_by_component: HashMap<ComponentId, usize>,
 }
 
 impl BevySchema {
@@ -182,10 +184,8 @@ impl BevySchema {
         &self,
         component_id: ComponentId,
     ) -> Option<&dyn ComponentAdapter> {
-        self.adapters
-            .iter()
-            .map(|adapter| adapter.as_ref())
-            .find(|adapter| adapter.component_id() == component_id)
+        let index = self.adapter_by_component.get(&component_id).copied()?;
+        self.adapters.get(index).map(|adapter| adapter.as_ref())
     }
 
     pub fn snapshot_entity(&self, world: &World, entity: Entity) -> Vec<ComponentSnapshot> {
@@ -228,7 +228,7 @@ impl BevySchema {
         entity_id: codec::EntityId,
         component_ids: &[ComponentId],
     ) -> Option<DeltaUpdateEntity> {
-        let mut components = Vec::new();
+        let mut components = Vec::with_capacity(component_ids.len());
         for component_id in component_ids {
             let adapter = self.adapter_by_component(*component_id)?;
             if let Some(update) = adapter.update_component(world, entity) {
@@ -276,9 +276,16 @@ impl BevySchemaBuilder {
             components.push(adapter.schema_def());
         }
         let schema = Schema::new(components).map_err(|err| anyhow!("{err:?}"))?;
+        let adapter_by_component = self
+            .adapters
+            .iter()
+            .enumerate()
+            .map(|(index, adapter)| (adapter.component_id(), index))
+            .collect();
         Ok(BevySchema {
             schema,
             adapters: self.adapters,
+            adapter_by_component,
         })
     }
 }

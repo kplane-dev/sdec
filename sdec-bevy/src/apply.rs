@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use bevy_ecs::prelude::World;
-use codec::{DeltaUpdateEntity, EntityId, EntitySnapshot, FieldValue};
+use codec::{DeltaUpdateEntity, EntityId, EntitySnapshot};
 
 use crate::mapping::EntityMap;
 use crate::schema::BevySchema;
@@ -49,8 +49,7 @@ pub fn apply_delta_updates(
             let adapter = schema
                 .adapter_by_component(component.id)
                 .ok_or_else(|| anyhow!("unknown component {:?}", component.id))?;
-            let fields: Vec<(usize, FieldValue)> = component.fields.clone();
-            adapter.apply_update(world, entity, &fields)?;
+            adapter.apply_update(world, entity, &component.fields)?;
         }
     }
     Ok(())
