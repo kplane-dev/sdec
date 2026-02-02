@@ -503,8 +503,14 @@ fn main() -> Result<()> {
                     );
                     let replication_elapsed = replication_start.elapsed();
                     let codec_start = Instant::now();
-                    let payload = bincode::serialize(&snapshot).context("serialize naive snapshot")?;
-                    (payload, replication_elapsed, codec_start.elapsed(), Duration::ZERO)
+                    let payload =
+                        bincode::serialize(&snapshot).context("serialize naive snapshot")?;
+                    (
+                        payload,
+                        replication_elapsed,
+                        codec_start.elapsed(),
+                        Duration::ZERO,
+                    )
                 }
                 Mode::Lightyear => {
                     let replication_start = Instant::now();
@@ -516,7 +522,12 @@ fn main() -> Result<()> {
                     let replication_elapsed = replication_start.elapsed();
                     let codec_start = Instant::now();
                     let payload = bitcode::encode(&snapshot);
-                    (payload, replication_elapsed, codec_start.elapsed(), Duration::ZERO)
+                    (
+                        payload,
+                        replication_elapsed,
+                        codec_start.elapsed(),
+                        Duration::ZERO,
+                    )
                 }
             };
             enc_times.push(start.elapsed());

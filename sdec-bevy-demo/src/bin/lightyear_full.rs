@@ -7,9 +7,10 @@ use bevy::prelude::*;
 use bevy::time::TimeUpdateStrategy;
 use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use lightyear::prelude::client::ClientCommands;
-use lightyear::prelude::server::ServerCommands;
-use lightyear::prelude::*;
+use lightyear::crossbeam::CrossbeamIo;
+use lightyear::link::SendPayload;
+use lightyear::netcode::generate_key;
+use lightyear::prelude::{client as ly_client, server as ly_server, *};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -39,7 +40,7 @@ struct Cli {
     validate: bool,
 }
 
-#[derive(Component, Clone, Copy, Serialize, Deserialize, Reflect)]
+#[derive(Component, Clone, Copy, Serialize, Deserialize, Reflect, PartialEq)]
 #[reflect(Component)]
 struct PositionYaw {
     x_q: i64,
@@ -47,14 +48,13 @@ struct PositionYaw {
     yaw: u16,
 }
 
-#[derive(Channel, Reflect)]
 struct ReplicationChannel;
 
 struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        app.register_component::<PositionYaw>(ChannelDirection::ServerToClient);
+        app.register_component::<PositionYaw>();
         app.add_channel::<ReplicationChannel>(ChannelSettings {
             mode: ChannelMode::UnorderedUnreliable,
             ..default()
@@ -104,10 +104,15 @@ struct Summary {
 }
 
 struct Forwarder {
-    s2c_raw_rx: Receiver<Vec<u8>>,
-    s2c_tx: Sender<Vec<u8>>,
-    c2s_raw_rx: Receiver<Vec<u8>>,
-    c2s_tx: Sender<Vec<u8>>,
+    s2c_raw_rx: Receiver<SendPayload>,
+    s2c_tx: Sender<SendPayload>,
+    c2s_raw_rx: Receiver<SendPayload>,
+    c2s_tx: Sender<SendPayload>,
+}
+
+struct ClientHandle {
+    app: App,
+    entity: Entity,
 }
 
 fn main() -> Result<()> {
@@ -118,80 +123,99 @@ fn main() -> Result<()> {
     let private_key = generate_key();
     let server_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
-    let mut channels = Vec::new();
-    let mut client_ios = Vec::new();
+    let tick_duration = Duration::from_secs_f32(1.0 / 60.0);
+
+    let mut server_app = App::new();
+    server_app.add_plugins(MinimalPlugins.build());
+    server_app.add_plugins((ly_server::ServerPlugins { tick_duration }, ProtocolPlugin));
+    server_app.finish();
+
+    let server_config = ly_server::NetcodeConfig::default()
+        .with_protocol_id(protocol_id)
+        .with_key(private_key);
+    let server_entity = server_app
+        .world_mut()
+        .spawn(ly_server::NetcodeServer::new(server_config))
+        .id();
+    server_app
+        .world_mut()
+        .run_system_once(move |mut commands: Commands| {
+            commands.trigger(ly_server::Start {
+                entity: server_entity,
+            });
+        })
+        .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+    let now = Instant::now();
+    server_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
+
     let mut forwarders = Vec::new();
+    let mut client_apps = Vec::new();
     for idx in 0..cli.clients {
-        let (s2c_raw_tx, s2c_raw_rx) = unbounded::<Vec<u8>>();
-        let (s2c_tx, s2c_rx) = unbounded::<Vec<u8>>();
-        let (c2s_raw_tx, c2s_raw_rx) = unbounded::<Vec<u8>>();
-        let (c2s_tx, c2s_rx) = unbounded::<Vec<u8>>();
-        let client_addr: SocketAddr = format!("127.0.0.1:{}", 20000 + idx).parse().unwrap();
-        channels.push((client_addr, c2s_rx, s2c_raw_tx));
-        client_ios.push((s2c_rx, c2s_raw_tx));
+        let (s2c_raw_tx, s2c_raw_rx) = unbounded::<SendPayload>();
+        let (s2c_tx, s2c_rx) = unbounded::<SendPayload>();
+        let (c2s_raw_tx, c2s_raw_rx) = unbounded::<SendPayload>();
+        let (c2s_tx, c2s_rx) = unbounded::<SendPayload>();
+
+        let server_link = server_app
+            .world_mut()
+            .spawn((
+                CrossbeamIo::new(s2c_raw_tx, c2s_rx),
+                ly_server::LinkOf {
+                    server: server_entity,
+                },
+            ))
+            .id();
+        server_app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                commands.trigger(LinkStart {
+                    entity: server_link,
+                });
+            })
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+
+        let auth = Authentication::Manual {
+            server_addr,
+            client_id: (idx as u64) + 1,
+            private_key,
+            protocol_id,
+        };
+        let netcode_client =
+            ly_client::NetcodeClient::new(auth, ly_client::NetcodeConfig::default())?;
+
+        let mut client_app = App::new();
+        client_app.add_plugins(MinimalPlugins.build());
+        client_app.add_plugins((ly_client::ClientPlugins { tick_duration }, ProtocolPlugin));
+        client_app.finish();
+
+        let client_entity = client_app
+            .world_mut()
+            .spawn((netcode_client, CrossbeamIo::new(c2s_raw_tx, s2c_rx)))
+            .id();
+        client_app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands| {
+                commands.trigger(LinkStart {
+                    entity: client_entity,
+                });
+                commands.trigger(ly_client::Connect {
+                    entity: client_entity,
+                });
+            })
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        client_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
+        client_apps.push(ClientHandle {
+            app: client_app,
+            entity: client_entity,
+        });
+
         forwarders.push(Forwarder {
             s2c_raw_rx,
             s2c_tx,
             c2s_raw_rx,
             c2s_tx,
         });
-    }
-
-    let shared = SharedConfig::default();
-    let server_config = server::ServerConfig {
-        shared: shared.clone(),
-        net: vec![server::NetConfig::Netcode {
-            config: server::NetcodeConfig::default()
-                .with_protocol_id(protocol_id)
-                .with_key(private_key),
-            io: IoConfig {
-                transport: TransportConfig::Channels { channels },
-                conditioner: None,
-            },
-        }],
-        ..Default::default()
-    };
-
-    let mut server_app = App::new();
-    server_app.add_plugins(MinimalPlugins.build());
-    server_app.add_plugins((server::ServerPlugin::new(server_config), ProtocolPlugin));
-    server_app.finish();
-    server_app
-        .world
-        .run_system_once(|mut commands: Commands| commands.start_server());
-
-    let now = bevy::utils::Instant::now();
-    server_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
-
-    let mut client_apps = Vec::new();
-    for (idx, (recv, send)) in client_ios.into_iter().enumerate() {
-        let net_config = client::NetConfig::Netcode {
-            auth: client::Authentication::Manual {
-                server_addr,
-                client_id: (idx as u64) + 1,
-                private_key,
-                protocol_id,
-            },
-            config: Default::default(),
-            io: IoConfig {
-                transport: TransportConfig::LocalChannel { recv, send },
-                conditioner: None,
-            },
-        };
-        let config = client::ClientConfig {
-            shared: shared.clone(),
-            net: net_config,
-            ..default()
-        };
-        let mut client_app = App::new();
-        client_app.add_plugins(MinimalPlugins.build());
-        client_app.add_plugins((client::ClientPlugin::new(config), ProtocolPlugin));
-        client_app.finish();
-        client_app
-            .world
-            .run_system_once(|mut commands: Commands| commands.connect_client());
-        client_app.insert_resource(TimeUpdateStrategy::ManualInstant(now));
-        client_apps.push(client_app);
     }
 
     // Spawn server entities.
@@ -201,7 +225,9 @@ fn main() -> Result<()> {
             y_q: 0,
             yaw: 0,
         };
-        server_app.world.spawn((position, Replicate::default()));
+        server_app
+            .world_mut()
+            .spawn((position, Replicate::default()));
     }
 
     let mut bytes = Vec::new();
@@ -210,7 +236,6 @@ fn main() -> Result<()> {
     let mut per_tick_bytes: Vec<u64> = vec![0; cli.clients as usize];
 
     let mut current_time = now;
-    let tick_duration = shared.tick.tick_duration;
 
     // Let connections handshake and sync before we start measuring.
     let mut synced = false;
@@ -218,23 +243,26 @@ fn main() -> Result<()> {
         current_time += tick_duration;
         server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
         for client_app in &mut client_apps {
-            client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+            client_app
+                .app
+                .insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
         }
         forward_client_to_server(&mut forwarders);
         server_app.update();
         per_tick_bytes.fill(0);
         forward_server_to_client(&mut forwarders, &mut per_tick_bytes);
         for client_app in &mut client_apps {
-            client_app.update();
+            client_app.app.update();
         }
 
-        let all_synced = client_apps.iter().all(|client_app| {
+        let all_connected = client_apps.iter().all(|client_app| {
             client_app
-                .world
-                .get_resource::<client::ConnectionManager>()
-                .is_some_and(|manager| manager.is_synced())
+                .app
+                .world()
+                .get::<ly_client::Connected>(client_app.entity)
+                .is_some()
         });
-        if all_synced {
+        if all_connected {
             synced = true;
             break;
         }
@@ -250,13 +278,16 @@ fn main() -> Result<()> {
         current_time += tick_duration;
         server_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
         for client_app in &mut client_apps {
-            client_app.insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
+            client_app
+                .app
+                .insert_resource(TimeUpdateStrategy::ManualInstant(current_time));
         }
 
         // mutate a subset of entities
         {
-            let mut query = server_app.world.query::<&mut PositionYaw>();
-            for mut pos in query.iter_mut(&mut server_app.world) {
+            let world = server_app.world_mut();
+            let mut query = world.query::<&mut PositionYaw>();
+            for mut pos in query.iter_mut(world) {
                 if rng.chance() > cli.dirty_pct {
                     continue;
                 }
@@ -271,7 +302,7 @@ fn main() -> Result<()> {
         server_app.update();
         server_times.push(server_start.elapsed());
         let server_digest = if cli.validate {
-            Some(state_digest_server(&mut server_app.world))
+            Some(state_digest_server(server_app.world_mut()))
         } else {
             None
         };
@@ -281,10 +312,10 @@ fn main() -> Result<()> {
         let mut per_tick_client_time = Duration::default();
         for client_app in &mut client_apps {
             let start = Instant::now();
-            client_app.update();
+            client_app.app.update();
             per_tick_client_time += start.elapsed();
             if let Some((server_count, server_hash)) = server_digest {
-                let (client_count, client_hash) = state_digest_client(&mut client_app.world);
+                let (client_count, client_hash) = state_digest_client(client_app.app.world_mut());
                 if client_count != server_count || client_hash != server_hash {
                     validation_errors += 1;
                 }

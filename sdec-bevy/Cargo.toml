@@ -16,7 +16,7 @@ name = "sdec_bevy"
 
 [dependencies]
 anyhow = "1.0"
-bevy_ecs = "0.13"
+bevy_ecs = "0.18"
 codec.workspace = true
 schema.workspace = true
 wire.workspace = true
