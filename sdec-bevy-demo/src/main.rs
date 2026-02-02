@@ -6,12 +6,13 @@ use anyhow::{Context, Result};
 use bevy_ecs::prelude::*;
 use clap::{Parser, ValueEnum};
 use codec::{FieldValue, SnapshotTick};
+use repgraph::{ClientId, ClientView, ReplicationConfig, ReplicationGraph, Vec3, WorldView};
 use sdec_bevy::{
     apply_changes, extract_changes, BevySchemaBuilder, EntityMap, ReplicatedComponent,
     ReplicatedField,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Parser)]
 #[command(name = "sdec-bevy-demo", version, about = "sdec Bevy demo harness")]
@@ -49,6 +50,9 @@ struct Cli {
     /// Simulated reorder rate (0.0 - 1.0) for scenario=loss.
     #[arg(long, default_value_t = 0.0)]
     reorder_rate: f32,
+    /// Validate client state against server state each tick.
+    #[arg(long, default_value_t = false)]
+    validate: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -187,47 +191,69 @@ struct Summary {
     apply_us_p95: u64,
     errors: u64,
     resyncs: u64,
+    validation_errors: u64,
+    total_create_entities: u64,
+    total_create_components: u64,
+    total_create_fields: u64,
+    total_update_entities: u64,
+    total_update_components: u64,
+    total_update_fields: u64,
+    total_destroy_entities: u64,
+    avg_create_entities_per_client_tick: f64,
+    avg_create_components_per_client_tick: f64,
+    avg_create_fields_per_client_tick: f64,
+    avg_update_entities_per_client_tick: f64,
+    avg_update_components_per_client_tick: f64,
+    avg_update_fields_per_client_tick: f64,
+    avg_destroy_entities_per_client_tick: f64,
 }
 
-struct ClientState {
+struct ClientState<'a> {
+    client_id: ClientId,
     world: World,
     entities: EntityMap,
-    known: HashSet<codec::EntityId>,
     visible: HashSet<codec::EntityId>,
-    change_set: ClientChangeSet,
-    delta_buf: Vec<u8>,
-    send_buf: Vec<u8>,
     session: Option<codec::SessionState>,
     last_tick: SnapshotTick,
+    last_applied_tick: SnapshotTick,
+    last_applied_full: bool,
     queue: VecDeque<Vec<u8>>,
     errors: u64,
+    encoder: codec::SessionEncoder<'a>,
+    delta_buf: Vec<u8>,
+    send_buf: Vec<u8>,
 }
 
-impl ClientState {
-    fn new() -> Self {
+struct ServerSnapshot {
+    tick: u32,
+    entities: Vec<(codec::EntityId, PositionYaw)>,
+}
+
+impl<'a> ClientState<'a> {
+    fn new(
+        client_id: ClientId,
+        schema: &'a schema::Schema,
+        limits: &'a codec::CodecLimits,
+        delta_buf_size: usize,
+        send_buf_size: usize,
+    ) -> Self {
         Self {
+            client_id,
             world: World::new(),
             entities: EntityMap::new(),
-            known: HashSet::new(),
             visible: HashSet::new(),
-            change_set: ClientChangeSet::default(),
-            delta_buf: Vec::new(),
-            send_buf: Vec::new(),
             session: None,
             last_tick: SnapshotTick::new(0),
+            last_applied_tick: SnapshotTick::new(0),
+            last_applied_full: false,
             queue: VecDeque::new(),
             errors: 0,
+            encoder: codec::SessionEncoder::new(schema, limits),
+            delta_buf: vec![0u8; delta_buf_size],
+            send_buf: vec![0u8; send_buf_size],
         }
     }
 }
-
-#[derive(Default)]
-struct ClientChangeSet {
-    creates: Vec<codec::EntitySnapshot>,
-    destroys: Vec<codec::EntityId>,
-    updates: Vec<codec::DeltaUpdateEntity>,
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.out_dir)
@@ -253,10 +279,6 @@ fn main() -> Result<()> {
         let _ = server_entities.entity_id(server);
     }
 
-    let client_positions = build_client_positions(clients, &mut rng);
-    let mut clients_state: Vec<ClientState> =
-        (0..clients as usize).map(|_| ClientState::new()).collect();
-
     let mut bytes = Vec::new();
     let mut enc_times = Vec::new();
     let mut replication_times = Vec::new();
@@ -265,6 +287,8 @@ fn main() -> Result<()> {
     let mut apply_times = Vec::new();
     let mut errors = 0u64;
     let mut resyncs = 0u64;
+    let mut validation_errors = 0u64;
+    let mut server_snapshots: VecDeque<ServerSnapshot> = VecDeque::new();
 
     let mut sdec_limits = codec::CodecLimits::default();
     let entity_count = cli.entities as usize;
@@ -277,8 +301,47 @@ fn main() -> Result<()> {
         .max(entity_count * 2);
     let full_buf_size = (entity_count.saturating_mul(1024)).max(16 * 1024 * 1024);
     let delta_buf_size = (entity_count.saturating_mul(512)).max(4 * 1024 * 1024);
-    let mut sdec_encoder = codec::SessionEncoder::new(schema.schema(), &sdec_limits);
+    let send_buf_size = full_buf_size.max(delta_buf_size);
     let mut sdec_session_init_bytes = 0u64;
+    let mut total_create_entities = 0u64;
+    let mut total_create_components = 0u64;
+    let mut total_create_fields = 0u64;
+    let mut total_update_entities = 0u64;
+    let mut total_update_components = 0u64;
+    let mut total_update_fields = 0u64;
+    let mut total_destroy_entities = 0u64;
+
+    let client_positions = build_client_positions(clients, &mut rng);
+    let view_radius = if visibility_radius <= 0 {
+        f32::MAX
+    } else {
+        visibility_radius as f32
+    };
+    let mut graph = ReplicationGraph::new(ReplicationConfig::default_limits());
+    let mut clients_state: Vec<ClientState<'_>> = (0..clients as usize)
+        .map(|idx| {
+            let client_id = ClientId((idx as u32) + 1);
+            let (x, y) = client_positions[idx];
+            graph.upsert_client(
+                client_id,
+                ClientView::new(
+                    Vec3 {
+                        x: x as f32,
+                        y: y as f32,
+                        z: 0.0,
+                    },
+                    view_radius,
+                ),
+            );
+            ClientState::new(
+                client_id,
+                schema.schema(),
+                &sdec_limits,
+                delta_buf_size,
+                send_buf_size,
+            )
+        })
+        .collect();
 
     if matches!(cli.mode, Mode::Sdec) {
         let mut init_buf = vec![0u8; 128];
@@ -313,6 +376,42 @@ fn main() -> Result<()> {
             .collect();
         let changes = extract_changes(&schema, &mut server_world, &mut server_entities);
 
+        if cli.validate {
+            let snapshot = build_server_snapshot(&mut server_world, &mut server_entities);
+            server_snapshots.push_back(ServerSnapshot {
+                tick,
+                entities: snapshot,
+            });
+            while server_snapshots.len() > 256 {
+                server_snapshots.pop_front();
+            }
+        }
+
+        let mut dirty_map: HashMap<codec::EntityId, Vec<schema::ComponentId>> = HashMap::new();
+        for update in &changes.updates {
+            let entry = dirty_map.entry(update.id).or_default();
+            for component in &update.components {
+                if !entry.contains(&component.id) {
+                    entry.push(component.id);
+                }
+            }
+        }
+        for (entity, pos) in &positions {
+            let id = server_entities.entity_id(*entity);
+            let dirty = dirty_map.remove(&id).unwrap_or_default();
+            graph.update_entity(
+                id,
+                Vec3 {
+                    x: pos.x_q as f32,
+                    y: pos.y_q as f32,
+                    z: 0.0,
+                },
+                &dirty,
+            );
+        }
+        for destroy in &changes.destroys {
+            graph.remove_entity(*destroy);
+        }
         for (client_idx, client_state) in clients_state.iter_mut().enumerate() {
             if all_visible {
                 client_state.visible.clear();
@@ -330,51 +429,57 @@ fn main() -> Result<()> {
             let (payload, replication_elapsed, codec_elapsed, header_elapsed) = match cli.mode {
                 Mode::Sdec => {
                     let replication_start = Instant::now();
-                    build_sdec_client_changes(
-                        &schema,
-                        &server_world,
-                        &mut server_entities,
-                        &changes.updates,
-                        &client_state.visible,
-                        &mut client_state.known,
-                        &mut client_state.change_set,
-                    );
+                    let world_view = DemoWorldView {
+                        schema: &schema,
+                        world: &server_world,
+                        entities: &server_entities,
+                    };
+                    let delta = graph.build_client_delta(client_state.client_id, &world_view);
+                    let replication_elapsed = replication_start.elapsed();
+                    total_create_entities += delta.creates.len() as u64;
+                    total_destroy_entities += delta.destroys.len() as u64;
+                    total_update_entities += delta.updates.len() as u64;
+                    for create in &delta.creates {
+                        total_create_components += create.components.len() as u64;
+                        for component in &create.components {
+                            total_create_fields += component.fields.len() as u64;
+                        }
+                    }
+                    for update in &delta.updates {
+                        total_update_components += update.components.len() as u64;
+                        for component in &update.components {
+                            total_update_fields += component.fields.len() as u64;
+                        }
+                    }
                     if tick == 1 {
-                        let snapshot = build_sdec_snapshot_for_ids(
-                            &schema,
-                            &server_world,
-                            &mut server_entities,
-                            &client_state.visible,
-                        );
-                        let replication_elapsed = replication_start.elapsed();
                         let codec_start = Instant::now();
-                        let _len = encode_full_snapshot_retry(
+                        let len = encode_full_snapshot_retry(
                             schema.schema(),
                             SnapshotTick::new(tick),
-                            &snapshot,
+                            &delta.creates,
                             &sdec_limits,
-                            full_buf_size,
                             &mut client_state.send_buf,
                         )?;
+                        let codec_elapsed = codec_start.elapsed();
+                        client_state.send_buf.truncate(len);
                         client_state.last_tick = SnapshotTick::new(tick);
                         let payload = std::mem::take(&mut client_state.send_buf);
-                        (payload, replication_elapsed, codec_start.elapsed(), Duration::ZERO)
+                        (payload, replication_elapsed, codec_elapsed, Duration::ZERO)
                     } else {
-                        let replication_elapsed = replication_start.elapsed();
                         let codec_start = Instant::now();
-                        let delta_len = encode_delta_retry(
-                            &mut sdec_encoder,
+                        let len = encode_delta_retry(
+                            &mut client_state.encoder,
                             SnapshotTick::new(tick),
                             SnapshotTick::new(tick.saturating_sub(1)),
-                            &client_state.change_set.creates,
-                            &client_state.change_set.destroys,
-                            &client_state.change_set.updates,
-                            delta_buf_size,
+                            &delta.creates,
+                            &delta.destroys,
+                            &delta.updates,
                             &mut client_state.delta_buf,
                         )?;
-                        let payload = &client_state.delta_buf[wire::HEADER_SIZE..delta_len];
+                        let codec_elapsed = codec_start.elapsed();
+                        let payload = &client_state.delta_buf[wire::HEADER_SIZE..len];
                         let header_start = Instant::now();
-                        let new_last_tick = build_compact_packet_into(
+                        let compact_len = build_compact_packet(
                             &mut client_state.send_buf,
                             wire::SessionFlags::delta_snapshot(),
                             client_state.last_tick,
@@ -382,9 +487,11 @@ fn main() -> Result<()> {
                             SnapshotTick::new(tick.saturating_sub(1)),
                             payload,
                         )?;
-                        client_state.last_tick = new_last_tick;
+                        let header_elapsed = header_start.elapsed();
+                        client_state.send_buf.truncate(compact_len);
+                        client_state.last_tick = SnapshotTick::new(tick);
                         let packet = std::mem::take(&mut client_state.send_buf);
-                        (packet, replication_elapsed, codec_start.elapsed(), header_start.elapsed())
+                        (packet, replication_elapsed, codec_elapsed, header_elapsed)
                     }
                 }
                 Mode::Naive => {
@@ -453,7 +560,9 @@ fn main() -> Result<()> {
                             &mut client_state.entities,
                             &snapshot,
                         );
-                        Ok(())
+                        client_state.last_applied_tick = SnapshotTick::new(tick);
+                        client_state.last_applied_full = true;
+                        Ok(AppliedPacket::Full(SnapshotTick::new(tick)))
                     }
                     Mode::Lightyear => {
                         let snapshot: SnapshotData =
@@ -463,13 +572,37 @@ fn main() -> Result<()> {
                             &mut client_state.entities,
                             &snapshot,
                         );
-                        Ok(())
+                        client_state.last_applied_tick = SnapshotTick::new(tick);
+                        client_state.last_applied_full = true;
+                        Ok(AppliedPacket::Full(SnapshotTick::new(tick)))
                     }
                 };
+                if matches!(cli.mode, Mode::Sdec) {
+                    if let Ok(applied) = &apply_result {
+                        match *applied {
+                            AppliedPacket::Full(tick) => {
+                                client_state.last_applied_tick = tick;
+                                client_state.last_applied_full = true;
+                            }
+                            AppliedPacket::Delta(tick) => {
+                                client_state.last_applied_tick = tick;
+                                client_state.last_applied_full = false;
+                            }
+                        }
+                    }
+                }
                 if apply_result.is_err() {
                     errors += 1;
                     client_state.errors += 1;
                     if matches!(cli.mode, Mode::Sdec) {
+                        let resync_tick = SnapshotTick::new(
+                            client_state
+                                .session
+                                .as_ref()
+                                .map(|state| state.last_tick.raw())
+                                .unwrap_or(0)
+                                + 1,
+                        );
                         if let Ok(resynced) = resync_client(
                             &schema,
                             &mut server_world,
@@ -482,11 +615,92 @@ fn main() -> Result<()> {
                         ) {
                             if resynced {
                                 resyncs += 1;
+                                client_state.last_applied_tick = resync_tick;
+                                client_state.last_applied_full = true;
+                                if cli.validate {
+                                    let snapshot = build_server_snapshot(
+                                        &mut server_world,
+                                        &mut server_entities,
+                                    );
+                                    server_snapshots.push_back(ServerSnapshot {
+                                        tick: resync_tick.raw(),
+                                        entities: snapshot,
+                                    });
+                                    while server_snapshots.len() > 256 {
+                                        server_snapshots.pop_front();
+                                    }
+                                }
+                                if cli.validate {
+                                    if let Some(snapshot) = server_snapshots
+                                        .iter()
+                                        .find(|entry| entry.tick == resync_tick.raw())
+                                    {
+                                        let expected_ids = if matches!(cli.scenario, Scenario::Loss)
+                                        {
+                                            client_state.entities.ids().into_iter().collect()
+                                        } else if visibility_radius <= 0 {
+                                            snapshot.entities.iter().map(|(id, _)| *id).collect()
+                                        } else {
+                                            visible_entity_ids_snapshot(
+                                                snapshot,
+                                                client_positions[client_idx],
+                                                visibility_radius,
+                                            )
+                                        };
+                                        let (server_count, server_hash) =
+                                            state_digest_snapshot(snapshot, &expected_ids);
+                                        let (client_count, client_hash) = state_digest(
+                                            &mut client_state.world,
+                                            &client_state.entities,
+                                            &expected_ids,
+                                        );
+                                        if client_count != server_count
+                                            || client_hash != server_hash
+                                        {
+                                            validation_errors += 1;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 } else {
                     apply_times.push(apply_start.elapsed());
+                    if cli.validate {
+                        if matches!(cli.scenario, Scenario::Loss) && !client_state.last_applied_full
+                        {
+                            continue;
+                        }
+                        let applied_tick = client_state.last_applied_tick.raw();
+                        if applied_tick > 0 {
+                            let snapshot = server_snapshots
+                                .iter()
+                                .find(|entry| entry.tick == applied_tick);
+                            if let Some(snapshot) = snapshot {
+                                let expected_ids = if matches!(cli.scenario, Scenario::Loss) {
+                                    client_state.entities.ids().into_iter().collect()
+                                } else if visibility_radius <= 0 {
+                                    snapshot.entities.iter().map(|(id, _)| *id).collect()
+                                } else {
+                                    visible_entity_ids_snapshot(
+                                        snapshot,
+                                        client_positions[client_idx],
+                                        visibility_radius,
+                                    )
+                                };
+                                let (server_count, server_hash) =
+                                    state_digest_snapshot(snapshot, &expected_ids);
+                                let (client_count, client_hash) = state_digest(
+                                    &mut client_state.world,
+                                    &client_state.entities,
+                                    &expected_ids,
+                                );
+                                if client_count != server_count || client_hash != server_hash {
+                                    validation_errors += 1;
+                                }
+                            }
+                        }
+                    }
                 }
                 if matches!(cli.mode, Mode::Sdec) {
                     client_state.send_buf = delivered;
@@ -495,10 +709,14 @@ fn main() -> Result<()> {
             }
         }
 
+        graph.clear_dirty();
+        graph.clear_removed();
         // Advance Bevy change detection so Changed/Added/Removed are per-tick.
         server_world.clear_trackers();
     }
 
+    let denom = (cli.ticks as u64).saturating_mul(clients as u64);
+    let denom_f64 = if denom == 0 { 1.0 } else { denom as f64 };
     let summary = Summary {
         mode: cli.mode,
         scenario: cli.scenario,
@@ -524,6 +742,21 @@ fn main() -> Result<()> {
         apply_us_p95: p95_duration_us(&mut apply_times.clone()),
         errors,
         resyncs,
+        validation_errors,
+        total_create_entities,
+        total_create_components,
+        total_create_fields,
+        total_update_entities,
+        total_update_components,
+        total_update_fields,
+        total_destroy_entities,
+        avg_create_entities_per_client_tick: total_create_entities as f64 / denom_f64,
+        avg_create_components_per_client_tick: total_create_components as f64 / denom_f64,
+        avg_create_fields_per_client_tick: total_create_fields as f64 / denom_f64,
+        avg_update_entities_per_client_tick: total_update_entities as f64 / denom_f64,
+        avg_update_components_per_client_tick: total_update_components as f64 / denom_f64,
+        avg_update_fields_per_client_tick: total_update_fields as f64 / denom_f64,
+        avg_destroy_entities_per_client_tick: total_destroy_entities as f64 / denom_f64,
     };
 
     let out_path = cli.out_dir.join("summary.json");
@@ -589,6 +822,56 @@ fn visible_entity_ids(
     visible
 }
 
+fn visible_entity_ids_snapshot(
+    snapshot: &ServerSnapshot,
+    client_pos: (i64, i64),
+    radius: i64,
+) -> HashSet<codec::EntityId> {
+    let mut visible = HashSet::new();
+    let radius_sq = radius.saturating_mul(radius);
+    for (id, pos) in &snapshot.entities {
+        let dx = pos.x_q - client_pos.0;
+        let dy = pos.y_q - client_pos.1;
+        let dist_sq = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+        if dist_sq <= radius_sq {
+            visible.insert(*id);
+        }
+    }
+    visible
+}
+
+struct DemoWorldView<'a> {
+    schema: &'a sdec_bevy::BevySchema,
+    world: &'a World,
+    entities: &'a EntityMap,
+}
+
+impl<'a> WorldView for DemoWorldView<'a> {
+    fn snapshot(&self, entity: codec::EntityId) -> codec::EntitySnapshot {
+        let Some(bevy_entity) = self.entities.entity(entity) else {
+            return codec::EntitySnapshot {
+                id: entity,
+                components: Vec::new(),
+            };
+        };
+        let components = self.schema.snapshot_entity(self.world, bevy_entity);
+        codec::EntitySnapshot {
+            id: entity,
+            components,
+        }
+    }
+
+    fn update(
+        &self,
+        entity: codec::EntityId,
+        dirty_components: &[schema::ComponentId],
+    ) -> Option<codec::DeltaUpdateEntity> {
+        let bevy_entity = self.entities.entity(entity)?;
+        self.schema
+            .build_delta_update(self.world, bevy_entity, entity, dirty_components)
+    }
+}
+
 fn build_sdec_snapshot_for_ids(
     schema: &sdec_bevy::BevySchema,
     world: &World,
@@ -613,50 +896,10 @@ fn build_sdec_snapshot_for_ids(
     snapshots
 }
 
-fn build_sdec_client_changes(
-    schema: &sdec_bevy::BevySchema,
-    world: &World,
-    entities: &mut EntityMap,
-    updates: &[codec::DeltaUpdateEntity],
-    visible_ids: &HashSet<codec::EntityId>,
-    known: &mut HashSet<codec::EntityId>,
-    change_set: &mut ClientChangeSet,
-) {
-    change_set.creates.clear();
-    change_set.destroys.clear();
-    change_set.updates.clear();
-
-    for id in visible_ids.iter().copied() {
-        if known.contains(&id) {
-            continue;
-        }
-        let Some(entity) = entities.entity(id) else {
-            continue;
-        };
-        let components = schema.snapshot_entity(world, entity);
-        if components.is_empty() {
-            continue;
-        }
-        change_set.creates.push(codec::EntitySnapshot { id, components });
-    }
-    change_set.creates.sort_by_key(|entity| entity.id.raw());
-
-    for id in known.iter().copied() {
-        if !visible_ids.contains(&id) {
-            change_set.destroys.push(id);
-        }
-    }
-    change_set.destroys.sort_by_key(|id| id.raw());
-
-    for update in updates {
-        if visible_ids.contains(&update.id) && known.contains(&update.id) {
-            change_set.updates.push(update.clone());
-        }
-    }
-
-    known.clear();
-    known.extend(visible_ids.iter().copied());
-
+#[derive(Clone, Copy)]
+enum AppliedPacket {
+    Full(SnapshotTick),
+    Delta(SnapshotTick),
 }
 
 fn apply_sdec_packet(
@@ -666,7 +909,7 @@ fn apply_sdec_packet(
     session: &mut Option<codec::SessionState>,
     limits: &codec::CodecLimits,
     bytes: &[u8],
-) -> Result<()> {
+) -> Result<AppliedPacket> {
     if bytes.len() >= 4 {
         let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         if magic == wire::MAGIC {
@@ -678,7 +921,7 @@ fn apply_sdec_packet(
             if let Some(state) = session.as_mut() {
                 state.last_tick = snapshot.tick;
             }
-            return Ok(());
+            return Ok(AppliedPacket::Full(snapshot.tick));
         }
     }
 
@@ -696,7 +939,7 @@ fn apply_sdec_packet(
         &decoded.destroys,
         &decoded.updates,
     )?;
-    Ok(())
+    Ok(AppliedPacket::Delta(session.last_tick))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -714,16 +957,22 @@ fn resync_client(
     if snapshot.is_empty() {
         return Ok(false);
     }
-    let mut buf = Vec::new();
+    let mut buf = vec![0u8; 256 * 1024];
     let len = encode_full_snapshot_retry(
         schema.schema(),
         SnapshotTick::new(session.as_ref().map(|s| s.last_tick.raw()).unwrap_or(0) + 1),
         &snapshot,
         limits,
-        256 * 1024,
         &mut buf,
     )?;
-    apply_sdec_packet(schema, client_world, client_entities, session, limits, &buf[..len])?;
+    let _ = apply_sdec_packet(
+        schema,
+        client_world,
+        client_entities,
+        session,
+        limits,
+        &buf[..len],
+    )?;
     Ok(true)
 }
 
@@ -732,19 +981,15 @@ fn encode_full_snapshot_retry(
     tick: SnapshotTick,
     snapshot: &[codec::EntitySnapshot],
     limits: &codec::CodecLimits,
-    start_size: usize,
     buf: &mut Vec<u8>,
 ) -> Result<usize> {
-    let mut size = start_size.max(1024);
+    let mut size = buf.len().max(1024);
     for _ in 0..5 {
         if buf.len() < size {
             buf.resize(size, 0);
         }
         match codec::encode_full_snapshot(schema, tick, snapshot, limits, buf) {
-            Ok(len) => {
-                buf.truncate(len);
-                return Ok(len);
-            }
+            Ok(len) => return Ok(len),
             Err(codec::CodecError::OutputTooSmall { needed, .. }) => {
                 size = size.max(needed).saturating_mul(2);
             }
@@ -762,10 +1007,9 @@ fn encode_delta_retry(
     creates: &[codec::EntitySnapshot],
     destroys: &[codec::EntityId],
     updates: &[codec::DeltaUpdateEntity],
-    start_size: usize,
     buf: &mut Vec<u8>,
 ) -> Result<usize> {
-    let mut size = start_size.max(1024);
+    let mut size = buf.len().max(1024);
     for _ in 0..5 {
         if buf.len() < size {
             buf.resize(size, 0);
@@ -779,10 +1023,7 @@ fn encode_delta_retry(
             updates,
             buf,
         ) {
-            Ok(len) => {
-                buf.truncate(len);
-                return Ok(len);
-            }
+            Ok(len) => return Ok(len),
             Err(codec::CodecError::OutputTooSmall { needed, .. }) => {
                 size = size.max(needed).saturating_mul(2);
             }
@@ -902,14 +1143,79 @@ fn apply_full_snapshot(
     Ok(())
 }
 
-fn build_compact_packet_into(
-    buf: &mut Vec<u8>,
+fn state_digest(
+    world: &mut World,
+    entities: &EntityMap,
+    expected_ids: &HashSet<codec::EntityId>,
+) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut hash = 0u64;
+    let mut query = world.query::<&PositionYaw>();
+    let mut ids: Vec<codec::EntityId> = expected_ids.iter().copied().collect();
+    ids.sort_by_key(|id| id.raw());
+    for id in ids {
+        let Some(entity) = entities.entity(id) else {
+            continue;
+        };
+        if let Ok(position) = query.get(world, entity) {
+            count += 1;
+            hash = mix_hash(hash, position);
+        }
+    }
+    (count, hash)
+}
+
+fn build_server_snapshot(
+    world: &mut World,
+    entities: &mut EntityMap,
+) -> Vec<(codec::EntityId, PositionYaw)> {
+    let mut entries = Vec::new();
+    let mut query = world.query::<(Entity, &PositionYaw)>();
+    for (entity, position) in query.iter(world) {
+        let id = entities.entity_id(entity);
+        entries.push((id, *position));
+    }
+    entries.sort_by_key(|(id, _)| id.raw());
+    entries
+}
+
+fn state_digest_snapshot(
+    snapshot: &ServerSnapshot,
+    expected_ids: &HashSet<codec::EntityId>,
+) -> (u64, u64) {
+    let mut count = 0u64;
+    let mut hash = 0u64;
+    for (id, position) in &snapshot.entities {
+        if !expected_ids.contains(id) {
+            continue;
+        }
+        count += 1;
+        hash = mix_hash(hash, position);
+    }
+    (count, hash)
+}
+
+fn mix_hash(mut hash: u64, position: &PositionYaw) -> u64 {
+    hash = hash
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(position.x_q as u64);
+    hash = hash
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(position.y_q as u64);
+    hash = hash
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(position.yaw as u64);
+    hash
+}
+
+fn build_compact_packet(
+    out: &mut Vec<u8>,
     flags: wire::SessionFlags,
     last_tick: SnapshotTick,
     tick: SnapshotTick,
     baseline_tick: SnapshotTick,
     payload: &[u8],
-) -> Result<SnapshotTick> {
+) -> Result<usize> {
     let tick_raw = tick.raw();
     let last_raw = last_tick.raw();
     let tick_delta = tick_raw
@@ -923,21 +1229,14 @@ fn build_compact_packet_into(
         .checked_sub(baseline_tick.raw())
         .ok_or_else(|| anyhow::anyhow!("baseline tick ahead of tick"))?;
     let needed = wire::SESSION_MAX_HEADER_SIZE + payload.len();
-    if buf.len() < needed {
-        buf.resize(needed, 0);
+    if out.len() < needed {
+        out.resize(needed, 0);
     }
-    let header_len = wire::encode_session_header(
-        buf,
-        flags,
-        tick_delta,
-        baseline_delta,
-        payload.len() as u32,
-    )
-    .map_err(|err| anyhow::anyhow!("encode session header: {err:?}"))?;
-    let end = header_len + payload.len();
-    buf[header_len..end].copy_from_slice(payload);
-    buf.truncate(end);
-    Ok(tick)
+    let header_len =
+        wire::encode_session_header(out, flags, tick_delta, baseline_delta, payload.len() as u32)
+            .map_err(|err| anyhow::anyhow!("encode session header: {err:?}"))?;
+    out[header_len..header_len + payload.len()].copy_from_slice(payload);
+    Ok(header_len + payload.len())
 }
 
 fn avg_u64(values: &[u64]) -> u64 {

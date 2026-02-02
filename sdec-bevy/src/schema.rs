@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use anyhow::{anyhow, Result};
 use bevy_ecs::prelude::{Component, Entity, World};
-use codec::{ComponentSnapshot, DeltaUpdateComponent, FieldValue};
+use codec::{ComponentSnapshot, DeltaUpdateComponent, DeltaUpdateEntity, FieldValue};
 use schema::{ChangePolicy, ComponentDef, ComponentId, FieldCodec, FieldDef, FieldId, Schema};
 
 #[derive(Debug, Clone)]
@@ -167,7 +167,7 @@ impl<T: ReplicatedComponent> ComponentAdapter for ComponentAdapterImpl<T> {
 pub struct BevySchema {
     pub schema: Schema,
     adapters: Vec<Box<dyn ComponentAdapter>>,
-    adapter_by_id: HashMap<ComponentId, usize>,
+    adapter_by_component: HashMap<ComponentId, usize>,
 }
 
 impl BevySchema {
@@ -184,7 +184,7 @@ impl BevySchema {
         &self,
         component_id: ComponentId,
     ) -> Option<&dyn ComponentAdapter> {
-        let index = *self.adapter_by_id.get(&component_id)?;
+        let index = self.adapter_by_component.get(&component_id).copied()?;
         self.adapters.get(index).map(|adapter| adapter.as_ref())
     }
 
@@ -220,6 +220,30 @@ impl BevySchema {
             .ok_or_else(|| anyhow!("unknown component {:?}", component_id))?;
         adapter.insert_component(world, entity, fields)
     }
+
+    pub fn build_delta_update(
+        &self,
+        world: &World,
+        entity: Entity,
+        entity_id: codec::EntityId,
+        component_ids: &[ComponentId],
+    ) -> Option<DeltaUpdateEntity> {
+        let mut components = Vec::with_capacity(component_ids.len());
+        for component_id in component_ids {
+            let adapter = self.adapter_by_component(*component_id)?;
+            if let Some(update) = adapter.update_component(world, entity) {
+                components.push(update);
+            }
+        }
+        if components.is_empty() {
+            None
+        } else {
+            Some(DeltaUpdateEntity {
+                id: entity_id,
+                components,
+            })
+        }
+    }
 }
 
 #[derive(Default)]
@@ -248,19 +272,20 @@ impl BevySchemaBuilder {
 
     pub fn build(self) -> Result<BevySchema> {
         let mut components = Vec::with_capacity(self.adapters.len());
-        let mut adapter_by_id = HashMap::with_capacity(self.adapters.len());
         for adapter in &self.adapters {
             components.push(adapter.schema_def());
-            let index = adapter_by_id.len();
-            adapter_by_id
-                .entry(adapter.component_id())
-                .or_insert(index);
         }
         let schema = Schema::new(components).map_err(|err| anyhow!("{err:?}"))?;
+        let adapter_by_component = self
+            .adapters
+            .iter()
+            .enumerate()
+            .map(|(index, adapter)| (adapter.component_id(), index))
+            .collect();
         Ok(BevySchema {
             schema,
             adapters: self.adapters,
-            adapter_by_id,
+            adapter_by_component,
         })
     }
 }
