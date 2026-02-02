@@ -181,6 +181,12 @@ struct Summary {
     bytes_p95: u64,
     encode_us_avg: u64,
     encode_us_p95: u64,
+    replication_us_avg: u64,
+    replication_us_p95: u64,
+    codec_us_avg: u64,
+    codec_us_p95: u64,
+    header_us_avg: u64,
+    header_us_p95: u64,
     apply_us_avg: u64,
     apply_us_p95: u64,
     errors: u64,
@@ -206,6 +212,7 @@ struct ClientState<'a> {
     client_id: ClientId,
     world: World,
     entities: EntityMap,
+    visible: HashSet<codec::EntityId>,
     session: Option<codec::SessionState>,
     last_tick: SnapshotTick,
     last_applied_tick: SnapshotTick,
@@ -234,6 +241,7 @@ impl<'a> ClientState<'a> {
             client_id,
             world: World::new(),
             entities: EntityMap::new(),
+            visible: HashSet::new(),
             session: None,
             last_tick: SnapshotTick::new(0),
             last_applied_tick: SnapshotTick::new(0),
@@ -246,7 +254,6 @@ impl<'a> ClientState<'a> {
         }
     }
 }
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.out_dir)
@@ -274,6 +281,9 @@ fn main() -> Result<()> {
 
     let mut bytes = Vec::new();
     let mut enc_times = Vec::new();
+    let mut replication_times = Vec::new();
+    let mut codec_times = Vec::new();
+    let mut header_times = Vec::new();
     let mut apply_times = Vec::new();
     let mut errors = 0u64;
     let mut resyncs = 0u64;
@@ -403,44 +413,46 @@ fn main() -> Result<()> {
             graph.remove_entity(*destroy);
         }
         for (client_idx, client_state) in clients_state.iter_mut().enumerate() {
-            let visible_ids = if all_visible {
-                all_ids.clone()
+            if all_visible {
+                client_state.visible.clear();
+                client_state.visible.extend(all_ids.iter().copied());
             } else {
-                visible_entity_ids(
+                client_state.visible = visible_entity_ids(
                     &positions,
                     &mut server_entities,
                     client_positions[client_idx],
                     visibility_radius,
-                )
-            };
+                );
+            }
 
             let start = Instant::now();
-            let payload = match cli.mode {
+            let (payload, replication_elapsed, codec_elapsed, header_elapsed) = match cli.mode {
                 Mode::Sdec => {
+                    let replication_start = Instant::now();
                     let world_view = DemoWorldView {
                         schema: &schema,
                         world: &server_world,
                         entities: &server_entities,
                     };
                     let delta = graph.build_client_delta(client_state.client_id, &world_view);
-                    if matches!(cli.mode, Mode::Sdec) {
-                        total_create_entities += delta.creates.len() as u64;
-                        total_destroy_entities += delta.destroys.len() as u64;
-                        total_update_entities += delta.updates.len() as u64;
-                        for create in &delta.creates {
-                            total_create_components += create.components.len() as u64;
-                            for component in &create.components {
-                                total_create_fields += component.fields.len() as u64;
-                            }
+                    let replication_elapsed = replication_start.elapsed();
+                    total_create_entities += delta.creates.len() as u64;
+                    total_destroy_entities += delta.destroys.len() as u64;
+                    total_update_entities += delta.updates.len() as u64;
+                    for create in &delta.creates {
+                        total_create_components += create.components.len() as u64;
+                        for component in &create.components {
+                            total_create_fields += component.fields.len() as u64;
                         }
-                        for update in &delta.updates {
-                            total_update_components += update.components.len() as u64;
-                            for component in &update.components {
-                                total_update_fields += component.fields.len() as u64;
-                            }
+                    }
+                    for update in &delta.updates {
+                        total_update_components += update.components.len() as u64;
+                        for component in &update.components {
+                            total_update_fields += component.fields.len() as u64;
                         }
                     }
                     if tick == 1 {
+                        let codec_start = Instant::now();
                         let len = encode_full_snapshot_retry(
                             schema.schema(),
                             SnapshotTick::new(tick),
@@ -448,10 +460,13 @@ fn main() -> Result<()> {
                             &sdec_limits,
                             &mut client_state.send_buf,
                         )?;
+                        let codec_elapsed = codec_start.elapsed();
                         client_state.send_buf.truncate(len);
                         client_state.last_tick = SnapshotTick::new(tick);
-                        std::mem::take(&mut client_state.send_buf)
+                        let payload = std::mem::take(&mut client_state.send_buf);
+                        (payload, replication_elapsed, codec_elapsed, Duration::ZERO)
                     } else {
+                        let codec_start = Instant::now();
                         let len = encode_delta_retry(
                             &mut client_state.encoder,
                             SnapshotTick::new(tick),
@@ -461,7 +476,9 @@ fn main() -> Result<()> {
                             &delta.updates,
                             &mut client_state.delta_buf,
                         )?;
+                        let codec_elapsed = codec_start.elapsed();
                         let payload = &client_state.delta_buf[wire::HEADER_SIZE..len];
+                        let header_start = Instant::now();
                         let compact_len = build_compact_packet(
                             &mut client_state.send_buf,
                             wire::SessionFlags::delta_snapshot(),
@@ -470,29 +487,55 @@ fn main() -> Result<()> {
                             SnapshotTick::new(tick.saturating_sub(1)),
                             payload,
                         )?;
+                        let header_elapsed = header_start.elapsed();
                         client_state.send_buf.truncate(compact_len);
                         client_state.last_tick = SnapshotTick::new(tick);
-                        std::mem::take(&mut client_state.send_buf)
+                        let packet = std::mem::take(&mut client_state.send_buf);
+                        (packet, replication_elapsed, codec_elapsed, header_elapsed)
                     }
                 }
                 Mode::Naive => {
+                    let replication_start = Instant::now();
                     let snapshot = build_snapshot_for_ids(
                         &mut server_world,
                         &mut server_entities,
-                        &visible_ids,
+                        &client_state.visible,
                     );
-                    bincode::serialize(&snapshot).context("serialize naive snapshot")?
+                    let replication_elapsed = replication_start.elapsed();
+                    let codec_start = Instant::now();
+                    let payload =
+                        bincode::serialize(&snapshot).context("serialize naive snapshot")?;
+                    (
+                        payload,
+                        replication_elapsed,
+                        codec_start.elapsed(),
+                        Duration::ZERO,
+                    )
                 }
                 Mode::Lightyear => {
+                    let replication_start = Instant::now();
                     let snapshot = build_snapshot_for_ids(
                         &mut server_world,
                         &mut server_entities,
-                        &visible_ids,
+                        &client_state.visible,
                     );
-                    bitcode::encode(&snapshot)
+                    let replication_elapsed = replication_start.elapsed();
+                    let codec_start = Instant::now();
+                    let payload = bitcode::encode(&snapshot);
+                    (
+                        payload,
+                        replication_elapsed,
+                        codec_start.elapsed(),
+                        Duration::ZERO,
+                    )
                 }
             };
             enc_times.push(start.elapsed());
+            replication_times.push(replication_elapsed);
+            codec_times.push(codec_elapsed);
+            if header_elapsed > Duration::ZERO {
+                header_times.push(header_elapsed);
+            }
             bytes.push(payload.len() as u64);
 
             if rng.chance() >= cli.drop_rate {
@@ -506,6 +549,7 @@ fn main() -> Result<()> {
                 }
             } else if matches!(cli.mode, Mode::Sdec) {
                 client_state.send_buf = payload;
+                client_state.send_buf.clear();
             }
 
             if let Some(delivered) = client_state.queue.pop_front() {
@@ -558,9 +602,6 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                if matches!(cli.mode, Mode::Sdec) {
-                    client_state.send_buf = delivered;
-                }
                 if apply_result.is_err() {
                     errors += 1;
                     client_state.errors += 1;
@@ -580,7 +621,7 @@ fn main() -> Result<()> {
                             &mut client_state.world,
                             &mut client_state.entities,
                             &mut client_state.session,
-                            &visible_ids,
+                            &client_state.visible,
                             &sdec_limits,
                         ) {
                             if resynced {
@@ -672,6 +713,10 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                if matches!(cli.mode, Mode::Sdec) {
+                    client_state.send_buf = delivered;
+                    client_state.send_buf.clear();
+                }
             }
         }
 
@@ -698,6 +743,12 @@ fn main() -> Result<()> {
         bytes_p95: p95_u64(&mut bytes.clone()),
         encode_us_avg: avg_duration_us(&enc_times),
         encode_us_p95: p95_duration_us(&mut enc_times.clone()),
+        replication_us_avg: avg_duration_us(&replication_times),
+        replication_us_p95: p95_duration_us(&mut replication_times.clone()),
+        codec_us_avg: avg_duration_us(&codec_times),
+        codec_us_p95: p95_duration_us(&mut codec_times.clone()),
+        header_us_avg: avg_duration_us(&header_times),
+        header_us_p95: p95_duration_us(&mut header_times.clone()),
         apply_us_avg: avg_duration_us(&apply_times),
         apply_us_p95: p95_duration_us(&mut apply_times.clone()),
         errors,

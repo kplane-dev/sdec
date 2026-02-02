@@ -14,6 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.89.0
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate release tag matches Cargo.toml version
@@ -70,6 +72,11 @@ jobs:
 
       - name: Publish repgraph
         run: cargo publish -p sdec-repgraph
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish sdec-bevy
+        run: cargo publish -p sdec-bevy
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

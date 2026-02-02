@@ -17,19 +17,67 @@
 For interest management and per-client change lists, use the `sdec-repgraph` crate. It decides
 what gets encoded and feeds directly into `codec::encode_delta_from_changes`.
 
+## What We Solve
+
+Real-time state replication needs predictable bandwidth and deterministic behavior, not just fast
+serialization. `sdec` is built to encode *snapshots and deltas* efficiently and safely, explicitly
+prioritizing network bytes over CPU when the two are in tension, with control over change
+detection, quantization, and wire budgets.
+
+## Philosophy
+
+- **Determinism over heuristics** — Same inputs produce the same bytes across platforms.
+- **Bandwidth first** — Bit-packed fields and delta semantics keep packets small.
+- **Explicit control** — Schemas define codecs, change policies, and thresholds.
+- **Composable layers** — Codec, schema, wire framing, and relevancy are separate concerns.
+
 ## Status
 
 🚧 **Work in Progress** — Core protocol is stable; sessions/compact headers and repgraph
 integration are active, and public APIs are still evolving.
 
-Full snapshots are for **initial sync and recovery**. Compact deltas are for
-**steady-state replication**.
-
 ## Initial Results (Simbench)
 
-- Global delta size (dense): 259B avg, 266B p95 (vs 268B/282B naive).
-- Per-client visibility: ~21B avg per client (naive list ~17B, full bincode ~65B).
-- Dirty-list encode (dense): ~2x faster (97us → 47us avg).
+Dense, 16 players, 300 ticks (delta encoding):
+
+Commands:
+
+```bash
+cargo run -p simbench --release
+```
+
+| Metric | SDEC delta | Bincode delta |
+| --- | --- | --- |
+| Avg bytes | 259B | 1114B |
+| P95 bytes | 266B | 1159B |
+| Encode avg | ~10us | ~2us |
+
+In this codec-only harness, SDEC produces significantly smaller deltas than a
+generic bincode delta payload at the cost of higher CPU per encode. This matters
+in realtime replication where bandwidth (not CPU) is often the limiting factor.
+
+## Initial Results (sdec-bevy-demo)
+
+Dense, 64 entities, 300 ticks, 100% dirty (end-to-end Bevy path):
+
+Commands:
+
+```bash
+cargo run -p sdec-bevy-demo --release --bin sdec-bevy-demo -- --entities 64 --ticks 300 --dirty-pct 1.0
+cargo run -p sdec-bevy-demo --release --bin sdec-bevy-demo -- --mode naive --entities 64 --ticks 300 --dirty-pct 1.0
+```
+
+| Metric | SDEC | Naive (bincode snapshot) |
+| --- | --- | --- |
+| Avg bytes | 649B | 1416B |
+| P95 bytes | 649B | 1416B |
+| Encode avg | ~26us | ~2us |
+| Apply avg | ~13us | ~3us |
+
+This path includes change extraction, delta building, encoding, and apply logic.
+The naive/bincode baseline is faster but more than 2x larger on the wire. SDEC
+trades CPU for bandwidth, which is usually the binding constraint in realtime
+replication.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for design details and [WIRE_FORMAT.md](WIRE_FORMAT.md) for the binary protocol specification.
 

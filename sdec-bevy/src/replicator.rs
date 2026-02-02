@@ -8,7 +8,7 @@ use codec::{
 use wire::{decode_packet, Limits as WireLimits};
 
 use crate::apply::apply_changes;
-use crate::extract::extract_changes;
+use crate::extract::{extract_changes_with_scratch, BevyChangeSet, ExtractScratch};
 use crate::mapping::EntityMap;
 use crate::metrics::{EncodeMetrics, MetricsSink};
 use crate::schema::BevySchema;
@@ -20,6 +20,8 @@ pub struct BevyReplicator {
     entities: EntityMap,
     session: Option<SessionState>,
     metrics: Option<Box<dyn MetricsSink>>,
+    change_set: BevyChangeSet,
+    extract_scratch: ExtractScratch,
 }
 
 impl BevyReplicator {
@@ -32,6 +34,8 @@ impl BevyReplicator {
             entities: EntityMap::new(),
             session: None,
             metrics: None,
+            change_set: BevyChangeSet::default(),
+            extract_scratch: ExtractScratch::default(),
         }
     }
 
@@ -56,16 +60,22 @@ impl BevyReplicator {
         baseline_tick: codec::SnapshotTick,
         out: &mut [u8],
     ) -> Result<usize> {
-        let changes = extract_changes(&self.schema, world, &mut self.entities);
+        extract_changes_with_scratch(
+            &self.schema,
+            world,
+            &mut self.entities,
+            &mut self.extract_scratch,
+            &mut self.change_set,
+        );
         let mut encoder = SessionEncoder::new(self.schema.schema(), &self.limits);
         let start = Instant::now();
         let bytes = encode_delta_from_changes(
             &mut encoder,
             tick,
             baseline_tick,
-            &changes.creates,
-            &changes.destroys,
-            &changes.updates,
+            &self.change_set.creates,
+            &self.change_set.destroys,
+            &self.change_set.updates,
             out,
         )?;
         if let Some(metrics) = self.metrics.as_mut() {

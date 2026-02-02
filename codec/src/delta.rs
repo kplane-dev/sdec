@@ -511,7 +511,8 @@ fn encode_delta_payload_from_updates(
 
     ensure_entity_ids_sorted(destroys)?;
     ensure_entities_sorted(creates)?;
-    validate_updates_for_encoding(schema, updates, limits)?;
+    let lookup = build_component_lookup(schema);
+    validate_updates_for_encoding(schema, updates, limits, &lookup)?;
 
     let mut offset = 0;
     if !destroys.is_empty() {
@@ -537,7 +538,11 @@ fn encode_delta_payload_from_updates(
             SectionTag::EntityUpdateSparsePacked,
             &mut out[offset..],
             limits,
-            |writer| encode_update_body_sparse_packed_from_updates(schema, updates, limits, writer),
+            |writer| {
+                encode_update_body_sparse_packed_from_updates(
+                    schema, updates, limits, &lookup, writer,
+                )
+            },
         )?;
         offset += written;
     }
@@ -887,6 +892,7 @@ fn validate_updates_for_encoding(
     schema: &schema::Schema,
     updates: &[DeltaUpdateEntity],
     limits: &CodecLimits,
+    lookup: &ComponentLookup,
 ) -> CodecResult<()> {
     let mut prev: Option<u32> = None;
     for entity_update in updates {
@@ -908,16 +914,7 @@ fn validate_updates_for_encoding(
             });
         }
         for component_update in &entity_update.components {
-            let component = schema
-                .components
-                .iter()
-                .find(|component| component.id == component_update.id)
-                .ok_or(CodecError::InvalidMask {
-                    kind: MaskKind::ComponentMask,
-                    reason: MaskReason::UnknownComponent {
-                        component: component_update.id,
-                    },
-                })?;
+            let component = lookup.component(schema, component_update.id)?;
             if component_update.fields.is_empty() {
                 return Err(CodecError::InvalidMask {
                     kind: MaskKind::FieldMask {
@@ -958,6 +955,7 @@ fn encode_update_body_sparse_packed_from_updates(
     schema: &schema::Schema,
     updates: &[DeltaUpdateEntity],
     limits: &CodecLimits,
+    lookup: &ComponentLookup,
     writer: &mut BitWriter<'_>,
 ) -> CodecResult<()> {
     if updates.len() > limits.max_entities_update {
@@ -983,21 +981,12 @@ fn encode_update_body_sparse_packed_from_updates(
     for entity_update in updates {
         let entity_id = entity_update.id.raw();
         for component_update in &entity_update.components {
-            let component = schema
-                .components
-                .iter()
-                .find(|component| component.id == component_update.id)
-                .ok_or(CodecError::InvalidMask {
-                    kind: MaskKind::ComponentMask,
-                    reason: MaskReason::UnknownComponent {
-                        component: component_update.id,
-                    },
-                })?;
+            let component = lookup.component(schema, component_update.id)?;
             writer.align_to_byte()?;
             writer.write_varu32(entity_id)?;
             writer.write_varu32(component.id.get() as u32)?;
             writer.write_varu32(component_update.fields.len() as u32)?;
-            let index_bits = required_bits(component.fields.len().saturating_sub(1) as u64);
+            let index_bits = lookup.index_bits(component.id);
             for (field_idx, value) in &component_update.fields {
                 if index_bits > 0 {
                     writer.write_bits(*field_idx as u64, index_bits)?;
@@ -1013,6 +1002,54 @@ fn encode_update_body_sparse_packed_from_updates(
     }
     writer.align_to_byte()?;
     Ok(())
+}
+
+struct ComponentLookup {
+    index: Vec<Option<usize>>,
+    index_bits: Vec<u8>,
+}
+
+impl ComponentLookup {
+    fn component<'a>(
+        &self,
+        schema: &'a schema::Schema,
+        id: ComponentId,
+    ) -> CodecResult<&'a ComponentDef> {
+        let idx = id.get() as usize;
+        let Some(Some(component_index)) = self.index.get(idx) else {
+            return Err(CodecError::InvalidMask {
+                kind: MaskKind::ComponentMask,
+                reason: MaskReason::UnknownComponent { component: id },
+            });
+        };
+        Ok(&schema.components[*component_index])
+    }
+
+    fn index_bits(&self, id: ComponentId) -> u8 {
+        let idx = id.get() as usize;
+        let Some(bits) = self.index_bits.get(idx).copied() else {
+            return 0;
+        };
+        bits
+    }
+}
+
+fn build_component_lookup(schema: &schema::Schema) -> ComponentLookup {
+    let max_id = schema
+        .components
+        .iter()
+        .map(|component| component.id.get() as usize)
+        .max()
+        .unwrap_or(0);
+    let mut index = vec![None; max_id + 1];
+    let mut index_bits = vec![0u8; max_id + 1];
+    for (component_index, component) in schema.components.iter().enumerate() {
+        let id = component.id.get() as usize;
+        index[id] = Some(component_index);
+        let bits = required_bits(component.fields.len().saturating_sub(1) as u64);
+        index_bits[id] = bits;
+    }
+    ComponentLookup { index, index_bits }
 }
 
 fn encode_destroy_body(
