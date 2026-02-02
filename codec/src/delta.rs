@@ -1047,7 +1047,7 @@ fn build_component_lookup(schema: &schema::Schema) -> ComponentLookup {
         let id = component.id.get() as usize;
         index[id] = Some(component_index);
         let bits = required_bits(component.fields.len().saturating_sub(1) as u64);
-        index_bits[id] = bits as u8;
+        index_bits[id] = bits;
     }
     ComponentLookup { index, index_bits }
 }
